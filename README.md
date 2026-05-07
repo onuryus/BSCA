@@ -132,8 +132,8 @@ cd ../..
 ### 3. Clone and build BSCA
 
 ```bash
-git clone https://github.com/onuryus/BSCS.git
-cd BSCS/build
+git clone https://github.com/onuryus/BSCA.git
+cd BSCA/build
 
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
@@ -185,7 +185,7 @@ DRUGBANK_BIN=/path/to/drugbank.bin
 ## Building the Index
 
 ```bash
-cd BSCS/build
+cd BSCA/build
 bash build_full_sharded.sh
 ```
 
