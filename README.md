@@ -319,28 +319,27 @@ Benchmarked on **Enamine REAL 136M molecules**, 4 shards × 34M, RTX 4060 Laptop
 | Per-shard FAISS index — CPU (12 threads) | ~2–3 h |
 | Full 4-shard build — CPU | ~8–12 h |
 
-### Search (CPU, per query)
+### Search — 136M molecules (4 shards, CPU vs GPU)
 
-| Stage | Time |
-|---|---|
-| NPASS + DrugBank load (first query only) | ~4 s |
-| Per-shard FAISS search (nprobe=64, k=5000) | ~50–200 ms/shard |
-| Enamine record retrieval (mmap, 20K reads) | ~100–300 ms |
-| Exact Tanimoto rerank (20K candidates) | ~200–500 ms |
-| Annotation + TSV write | ~5 ms |
-| **Total per query** | **~0.5–1.5 s** |
+| Stage | CPU | GPU |
+|---|---|---|
+| NPASS + DrugBank load (first query only) | ~4 s | ~4 s |
+| Per-shard FAISS search (nprobe=64, k=5000) | ~50–200 ms/shard | ~5–30 ms/shard |
+| Enamine record retrieval (mmap, 20K reads) | ~100–300 ms | ~100–300 ms |
+| Exact Tanimoto rerank (20K candidates) | ~200–500 ms | ~200–500 ms |
+| Annotation + TSV write | ~5 ms | ~5 ms |
+| **Total per query** | **~0.5–1.5 s** | **~0.3–1.0 s** |
 
-### Memory (4 shards × 34M, m=16, jobs=1)
+### Search — large scale (GPU, per query)
 
-| Component | RAM |
-|---|---|
-| FAISS shard (one at a time) | ~0.8 GB |
-| Global offset file (mmap) | ~1.1 GB |
-| NPASS in RAM | ~0.5 GB |
-| DrugBank in RAM | ~0.1 GB |
-| **Total** | **~2.5 GB** |
+| Database | Shards | Passes | FAISS search | Total |
+|---|---|---|---|---|
+| 1B mol (8 shards) | 8 | 1 | ~40–240 ms | **~0.4–1.0 s** |
+| 10B mol (74 shards) | 74 | 4 | ~0.8–2 s | **~1.5–3 s** |
+| 30B mol (221 shards) | 221 | 12 | ~2–3 s | **~3–4 s** |
 
-`--jobs 4` loads all 4 shards in parallel: ~5 GB, ~4× faster search.
+> Passes = number of search rounds based on available RAM (64 GB assumed).
+> Retrieval and rerank cost scales with total candidates, not shard count.
 
 ---
 
