@@ -1,5 +1,20 @@
+# ── Data directories (large files, not for version control) ──────────────────
 data/*
 index/*
-build/*
-rdkit/*
 rdkit/
+rdkit/*
+
+# ── Build directory: ignore everything except shell scripts and config template
+build/*
+!build/*.sh
+!build/config.sh.example
+
+# ── User configuration (contains personal paths — never commit) ───────────────
+build/config.sh
+
+# ── Editor and OS artifacts ───────────────────────────────────────────────────
+.DS_Store
+*~
+*.swp
+*.orig
+build/.~lock.*

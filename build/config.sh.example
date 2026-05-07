@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  BSCS — User Path Configuration
+#  Copy this file to config.sh and fill in your paths.
+#
+#    cp config.sh.example config.sh
+#    nano config.sh          # or your preferred editor
+#
+#  config.sh is listed in .gitignore and will never be committed.
+# =============================================================================
+
+# ── Required: Enamine REAL Database ──────────────────────────────────────────
+# The Enamine CXSMILES file you downloaded.
+# Example: ENAMINE=/data/enamine/2026.01_Enamine_REAL_DB_136M.cxsmiles
+ENAMINE=""
+
+# ── Required: NPASS raw data directory ───────────────────────────────────────
+# The directory you downloaded from https://bidd.group/NPASS/
+# Must contain: NPASS3.0_activities.txt, NPASS3.0_naturalproducts_structure.txt, etc.
+# Example: NPASS_RAW=/data/npass
+NPASS_RAW=""
+
+# ── Required: Index output directory ─────────────────────────────────────────
+# Where FAISS indexes, offset files, and binary indexes will be written.
+# Will be created automatically if it does not exist.
+# Example: IDIR=/data/bscs_index
+IDIR=""
+
+# ── Optional: DrugBank XML ────────────────────────────────────────────────────
+# Full DrugBank database export (requires a DrugBank account and licence).
+# Leave empty to skip DrugBank indexing (NPASS + Enamine will still work).
+# Example: DRUGBANK_XML=/data/drugbank/drugbank.xml
+DRUGBANK_XML=""
+
+# ── Optional: DrugBank pre-built binary ──────────────────────────────────────
+# If you already ran prepare_drugbank and have a drugbank.bin, set this path
+# to skip re-indexing. If empty, DRUGBANK_XML is used and the binary is
+# written to $IDIR/drugbank/drugbank.bin.
+# Example: DRUGBANK_BIN=/data/drugbank/drugbank.bin
+DRUGBANK_BIN=""

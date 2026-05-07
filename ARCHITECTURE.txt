@@ -1,0 +1,1203 @@
+================================================================================
+  BSCS — Billion-Scale Chemical Search
+  Full System Architecture
+================================================================================
+
+Last updated: 2026-05-07
+Build environment: conda env chem_cpp, C++20, GCC 15, Linux x86-64
+Primary data:
+  - Enamine REAL DB   : 2026.01_Enamine_REAL_DB_136M.cxsmiles  (~136M molecules)
+  - NPASS 3.0          : 11 TSV/TXT files  (~30K-80K natural products)
+  - DrugBank           : drugbank.xml  (19,857 drugs; 14,630 with InChIKey)
+
+================================================================================
+  SECTION 1 — OVERALL PIPELINE
+================================================================================
+
+  ── Single-index workflow (≤136M molecules, one FAISS index) ─────────────────
+
+  INPUT                OUTPUT           TOOL
+  ─────────────────────────────────────────────────────────────────────────────
+  Enamine .cxsmiles  → offsets + meta  [ prepare_enamine     ]  (one-time)
+  offsets.bin        → faiss.index     [ build_enamine_index ]  (one-time, slow)
+  NPASS raw dir      → *.bin files     [ prepare_npass       ]  (one-time, fast)
+  DrugBank .xml      → drugbank.bin    [ prepare_drugbank    ]  (one-time, ~12 s)
+  query SMILES       → results.tsv     [ search_annotate     ]  (per-query, fast)
+
+  ── Sharded workflow (136M+ molecules, multiple FAISS shards) ────────────────
+
+  INPUT                    OUTPUT            TOOL
+  ─────────────────────────────────────────────────────────────────────────────
+  Enamine .cxsmiles      → offsets + meta    [ prepare_enamine          ]  (once)
+  NPASS raw dir          → *.bin files       [ prepare_npass            ]  (once)
+  DrugBank .xml          → drugbank.bin      [ prepare_drugbank         ]  (once)
+  offsets.bin            → N×faiss.index     [ build_sharded_database   ]  (once)
+                           shard_config.json
+  query SMILES +         → results.tsv       [ search_sharded_database  ]  (per-query)
+  shard_config.json
+
+  Pipeline sequence (sharded):
+
+  Step 1 — prepare_enamine
+    Scans the Enamine CXSMILES file sequentially.
+    Records the byte offset of each data line (one uint64_t per molecule).
+    Writes: enamine.offsets.bin, enamine.header.tsv, enamine.schema.json,
+            enamine.count
+    Purpose: decouple I/O scan from FP computation; shared across all shards.
+    The Enamine file is NEVER loaded fully into RAM at any step.
+
+  Step 2 — build_sharded_database   (coordinator)
+    Reads total molecule count from enamine.count.
+    Divides range [0, N) into equal shard slices.
+    Asks GPU/CPU preference once (propagates to all shards).
+    For each shard: calls build_enamine_index as a subprocess with
+      --mol-start / --mol-end (global molecule indices) and --gpu/--no-gpu.
+    Skips already-built shards (safe to interrupt and re-run).
+    Writes: shard_config.json (single metadata file for the whole index).
+
+  Step 3 — build_enamine_index   (per shard, called by build_sharded_database)
+    Opens the global offsets file. Reads only the slice [mol_start, mol_end).
+    Computes Morgan fingerprints in parallel (OMP).
+    Trains FAISS IVFPQ on the first train_size molecules of the shard.
+    Streams the shard molecules and adds them with global mol_ids:
+      FAISS ID = mol_start + local_index   (globally unique across all shards)
+    After adding, copies GPU index to CPU and writes to disk.
+    Writes: shard_NNN/faiss.index, shard_NNN/build_errors.smi
+
+  Step 4 — prepare_npass
+    Loads all 11 NPASS tables from TSV/TXT files.
+    Builds InChIKey-sorted and SMILES-sorted lookup indexes.
+    Serializes everything to 13 binary files for fast loading at query time.
+    Total NPASS data is small (<200 MB) and fits entirely in RAM.
+
+  Step 5 — prepare_drugbank
+    Streams the DrugBank XML using a custom SAX-style tokenizer.
+    Parses all fields: pharmacology text, calculated properties,
+    targets/enzymes/transporters/carriers, classification, synonyms, categories.
+    Writes: drugbank.bin (~82 MB)
+    Parser throughput: ~215 MB/s; ~12 s for the full XML.
+    Binary load time: <0.3 s.
+
+  Step 6 — search_sharded_database   (per query or interactive session)
+    Loads shard_config.json to know all shard files and mol ranges.
+    Opens a single EnamineReader (shared across shards).
+    Loads NPASS index and DrugBank index once into RAM.
+    For each query:
+      Parses SMILES → Morgan FP.
+      Runs direct Tanimoto similarity against NPASS and DrugBank.
+      For each shard: loads FAISS index, searches, frees index.
+      Merges all shard candidates by FAISS distance (global sort + dedup).
+      Fetches Enamine records by global mol_id → exact Tanimoto rerank.
+      Annotates top-N with NPASS and DrugBank matches.
+    Writes: results.tsv, results_enamine.tsv, results_npass.tsv,
+            results_drugbank.tsv  (output mode configurable)
+    Session mode: if --query is omitted, loops interactively asking for
+    each query SMILES and whether to continue.
+
+================================================================================
+  SECTION 2 — FULL FILE LAYOUT
+================================================================================
+
+  BSCS/
+  ├── CMakeLists.txt                  Build system (C++20, O3, march=native)
+  ├── ARCHITECTURE.txt                This file
+  ├── SCALE_GUIDE.txt
+  ├── README.md
+  ├── LICENSE
+  │
+  ├── src/
+  │   ├── common/
+  │   │   ├── logger.hpp              Thread-safe stderr logger (LOG_INFO etc.)
+  │   │   ├── mmap_file.hpp           POSIX mmap wrapper; read_line(offset)
+  │   │   ├── tsv_utils.hpp           split_tsv, strip_cxsmiles, parse_header,
+  │   │   │                           col_index, binary write helpers (write_str)
+  │   │   ├── fp_utils.hpp            smiles_to_mol, mol_to_fp_float,
+  │   │   │                           mol_to_fp_bv, mol_to_canonical_smiles (Morgan)
+  │   │   ├── similarity.hpp          Tanimoto, Dice, Tversky, Cosine,
+  │   │   │                           Kulczynski via RDKit BitOps
+  │   │   ├── progress.hpp            Progress (known total, \r bar),
+  │   │   │                           ProgressBytes (byte-unit variant),
+  │   │   │                           Spinner (unknown duration)
+  │   │   └── shard_config.hpp        ShardEntry + ShardConfig: hand-written JSON
+  │   │                               save/load for the shard metadata file
+  │   │
+  │   ├── enamine/
+  │   │   ├── offset_store.hpp        OffsetWriter (sequential write) +
+  │   │   │                           OffsetStore (mmap'd read, O(1) by mol_id)
+  │   │   └── enamine_reader.hpp      EnamineRecord (all columns), EnamineReader
+  │   │                               (fetch by mol_id using mmap + offsets)
+  │   │
+  │   ├── npass/
+  │   │   ├── npass_types.hpp         NpassRow (unordered_map<string,string>),
+  │   │   │                           NpassCompound (joined record from all tables)
+  │   │   └── npass_index.hpp         NpassIndex: loads all NPASS tables into RAM,
+  │   │                               lookup(inchikey, smiles) → NpassCompound
+  │   │
+  │   ├── drugbank/
+  │   │   ├── drugbank_types.hpp      DrugBankTarget, DrugBankDrug structs
+  │   │   └── drugbank_index.hpp      DrugBankIndex: streaming XML parser,
+  │   │                               binary save/load_binary(), lookup by
+  │   │                               InChIKey or canonical SMILES
+  │   │
+  │   ├── prepare_enamine.cpp          → executable: prepare_enamine
+  │   ├── build_enamine_index.cpp      → executable: build_enamine_index
+  │   ├── prepare_npass.cpp            → executable: prepare_npass
+  │   ├── prepare_drugbank.cpp         → executable: prepare_drugbank
+  │   ├── search_annotate.cpp          → executable: search_annotate
+  │   ├── build_sharded_database.cpp   → executable: build_sharded_database
+  │   ├── search_sharded_database.cpp  → executable: search_sharded_database
+  │   ├── build_index.cpp              (legacy, kept for compatibility)
+  │   └── search_index.cpp             (legacy, kept for compatibility)
+  │
+  └── build/
+      ├── prepare_enamine              (compiled executable)
+      ├── build_enamine_index          (compiled executable)
+      ├── prepare_npass                (compiled executable)
+      ├── prepare_drugbank             (compiled executable)
+      ├── search_annotate              (compiled executable)
+      ├── build_sharded_database       (compiled executable)
+      ├── search_sharded_database      (compiled executable)
+      ├── build_full_sharded.sh        Production build script (4-shard Enamine)
+      └── search_full_sharded.sh       Production search script
+
+  INDEX FILES (produced at runtime):
+  index/
+  ├── enamine/                         (single-index workflow)
+  │   ├── enamine.offsets.bin          uint64_t[N]: byte offset of molecule i
+  │   ├── enamine.header.tsv           single line: original TSV header
+  │   ├── enamine.schema.json          JSON list of column names
+  │   ├── enamine.count                plain text: total molecule count
+  │   ├── faiss.index                  FAISS IVFPQ serialized index
+  │   └── build_errors.smi             SMILES that failed RDKit parsing
+  │
+  ├── enamine_sharded/                 (sharded workflow — 4 shards for 136M)
+  │   ├── shard_config.json            Single metadata file describing all shards
+  │   ├── enamine.offsets.bin          Global offset file (shared by all shards)
+  │   ├── enamine.header.tsv
+  │   ├── enamine.schema.json
+  │   ├── enamine.count
+  │   ├── shard_001/
+  │   │   ├── faiss.index              FAISS IVFPQ for molecules [0, 34M)
+  │   │   └── build_errors.smi
+  │   ├── shard_002/
+  │   │   ├── faiss.index              FAISS IVFPQ for molecules [34M, 68M)
+  │   │   └── build_errors.smi
+  │   ├── shard_003/   ...             [68M, 102M)
+  │   └── shard_004/   ...             [102M, 136M)
+  │
+  ├── npass/
+  │   ├── npass_index.manifest         version + compound count metadata
+  │   ├── inchikey_index.bin           sorted (char[27], np_id[]) pairs
+  │   ├── smiles_index.bin             sorted (var-len smiles, np_id[]) pairs
+  │   ├── structure.bin                np_id → {InChI, InChIKey, SMILES}
+  │   ├── generalinfo.bin              np_id → general info row
+  │   ├── targets.bin                  target_id → target row
+  │   ├── species_info.bin             org_id → species row
+  │   ├── activities.bin               np_id → [activity rows]
+  │   ├── toxicity.bin                 np_id → [toxicity rows]
+  │   ├── species_pair.bin             np_id → [species pair rows]
+  │   ├── coculture.bin                np_id → [coculture rows]
+  │   ├── elicitation.bin              np_id → [elicitation rows]
+  │   ├── engineer.bin                 np_id → [engineer rows]
+  │   └── symbiont.bin                 np_id → [symbiont rows]
+  │
+  └── drugbank/
+      └── drugbank.bin                 magic(4) + count(4) + drug records
+                                       (produced by prepare_drugbank)
+
+  shard_config.json format:
+  {
+    "total_molecules":    136000000,
+    "cxsmiles_path":      "/path/to/enamine.cxsmiles",
+    "offsets_path":       "/path/to/enamine_sharded/enamine.offsets.bin",
+    "header_path":        "/path/to/enamine_sharded/enamine.header.tsv",
+    "fp_radius":          3,
+    "fp_nbits":           1024,
+    "nlist":              4096,
+    "pq_m":               16,
+    "pq_nbits":           8,
+    "shards": [
+      { "id": 1, "mol_start": 0,        "mol_end": 34000000,
+        "faiss_path": "/path/to/shard_001/faiss.index" },
+      { "id": 2, "mol_start": 34000000, "mol_end": 68000000,
+        "faiss_path": "/path/to/shard_002/faiss.index" },
+      ...
+    ]
+  }
+
+================================================================================
+  SECTION 3 — COMMAND-LINE FLAGS
+================================================================================
+
+  ── prepare_enamine ──────────────────────────────────────────────────────────
+
+    --input   FILE      (required) Enamine CXSMILES file (.cxsmiles / .smi)
+    --outdir  DIR       (required) Output directory for offset index files
+
+    Outputs:
+      enamine.offsets.bin   — binary offset index
+      enamine.header.tsv    — original TSV header line
+      enamine.schema.json   — JSON list of column names
+      enamine.count         — total molecule count (plain text)
+
+    Example:
+      ./prepare_enamine \
+        --input  ../../2026.01_Enamine_REAL_DB_136M.cxsmiles \
+        --outdir ../../index/enamine_sharded
+
+  ── build_enamine_index ──────────────────────────────────────────────────────
+
+    --input       FILE    (required) Enamine CXSMILES file
+    --offsets     FILE    (required) enamine.offsets.bin from prepare_enamine
+    --out         FILE    (required) Output FAISS index path
+    --header      FILE    (optional) enamine.header.tsv (guessed if omitted)
+    --mol-start   INT     First global molecule index for this shard   default: 0
+    --mol-end     INT     One-past-last global index (0 = full file)   default: 0
+    --gpu                 Force GPU backend (skip interactive prompt)
+    --no-gpu              Force CPU backend (skip interactive prompt)
+    --radius      INT     Morgan FP radius            default: 3
+    --nbits       INT     Morgan FP bit count          default: 4096
+    --batch       INT     Molecules per add-batch      default: 100000
+    --nlist       INT     FAISS IVF cell count         default: 4096
+    --m           INT     PQ sub-vectors               default: 32
+    --nbits-pq    INT     Bits per PQ sub-vector       default: 8
+    --train-size  INT     Molecules used for training  default: 500000
+    --threads     INT     OMP thread count             default: 16
+    --profile             Print per-phase timing summary at end
+
+    Notes:
+    - FAISS IDs stored = mol_start + local_index (globally unique).
+    - Training molecules are the first train_size molecules of the shard
+      (sequential from mol_start, not random).
+    - When called by build_sharded_database, --gpu/--no-gpu is always passed
+      so the interactive GPU prompt never appears inside a shard subprocess.
+
+    Example (shard 2 of 4):
+      ./build_enamine_index \
+        --input      ../../2026.01_Enamine_REAL_DB_136M.cxsmiles \
+        --offsets    ../../index/enamine_sharded/enamine.offsets.bin \
+        --out        ../../index/enamine_sharded/shard_002/faiss.index \
+        --mol-start  34000000 --mol-end 68000000 \
+        --no-gpu \
+        --radius 3 --nbits 1024 --nlist 4096 --m 16 \
+        --train-size 500000 --batch 1000000 --threads 12
+
+  ── build_sharded_database ───────────────────────────────────────────────────
+
+    --input        FILE    (required) Enamine CXSMILES file
+    --outdir       DIR     (required) Output directory for all shard files
+    --num-shards   INT     Number of equal-size shards to create  default: 4
+    --mols-per-shard INT   Alternative: fixed molecules per shard (overrides --num-shards)
+    --skip-prepare        Skip prepare_enamine step (offset files already exist)
+    --gpu                 Force GPU for all shards (no interactive prompt)
+    --no-gpu              Force CPU for all shards (no interactive prompt)
+    --yes                 Skip confirmation prompt before starting build
+    --radius      INT     Morgan FP radius            default: 3
+    --nbits       INT     Morgan FP bit count          default: 1024
+    --nlist       INT     FAISS IVF cell count         default: 4096
+    --m           INT     PQ sub-vectors               default: 16
+    --nbits-pq    INT     Bits per PQ sub-vector       default: 8
+    --train-size  INT     Molecules per shard for training  default: 500000
+    --batch       INT     Molecules per add-batch      default: 1000000
+    --threads     INT     OMP thread count             default: 12
+
+    Behavior:
+    - Step 1: calls prepare_enamine --input X --outdir OUTDIR
+    - Step 2: reads enamine.count to get total_mols
+    - Step 3: shows RAM/disk estimate; shows GPU options (if --gpu/--no-gpu absent)
+    - Step 4: for each shard i: checks if shard_NNN/faiss.index exists (skip if yes);
+              otherwise runs build_enamine_index as subprocess.
+    - Step 5: writes shard_config.json
+    - Re-runnable: already-built shards are automatically skipped.
+
+    Example (production, 4 shards of 136M):
+      ./build_sharded_database \
+        --input        ../../2026.01_Enamine_REAL_DB_136M.cxsmiles \
+        --outdir       ../../index/enamine_sharded \
+        --num-shards   4 \
+        --radius       3 --nbits 1024 \
+        --nlist        4096 --m 16 --nbits-pq 8 \
+        --train-size   500000 \
+        --batch        1000000 \
+        --threads      12 \
+        --yes
+
+  ── prepare_npass ────────────────────────────────────────────────────────────
+
+    --npass-dir  DIR    (required) Directory containing NPASS 3.0 files
+    --outdir     DIR    (required) Output directory for binary index files
+
+    Expected input files in npass-dir:
+      NPASS3.0_naturalproducts_structure.txt
+      NPASS3.0_naturalproducts_generalinfo.txt
+      NPASS3.0_activities.txt
+      NPASS3.0_toxicity.txt
+      NPASS3.0_naturalproducts_species_pair.txt
+      NPASS3.0_target.txt
+      NPASS3.0_species_info.txt
+      NPASS3.0_Coculture.tsv
+      NPASS3.0_Elicitation.tsv
+      NPASS3.0_Engineer.tsv
+      NPASS3.0_Symbiont.tsv
+
+    Example:
+      ./prepare_npass \
+        --npass-dir ../../npass \
+        --outdir    ../../index/npass
+
+  ── prepare_drugbank ─────────────────────────────────────────────────────────
+
+    --xml     FILE    (required) DrugBank XML file (drugbank.xml)
+    --outdir  DIR     (required) Output directory for binary index
+
+    Outputs:
+      drugbank.bin    — binary drug record index (~82 MB for full database)
+
+    Example:
+      ./prepare_drugbank \
+        --xml    /data/drugbank/drugbank.xml \
+        --outdir ../../index/drugbank
+
+  ── search_sharded_database ──────────────────────────────────────────────────
+
+    --config      FILE     (required) shard_config.json path
+    --npass-index DIR      (optional) Raw NPASS directory (containing NPASS TSV files)
+    --drugbank-bin FILE    (optional) drugbank.bin (from prepare_drugbank)
+    --databases   STRING   (optional) Comma-separated: enamine,npass,drugbank or "all"
+    --query       SMILES   (optional) Query SMILES; if omitted, runs in session mode
+    --metric      STRING   tanimoto|dice|tversky|cosine|kulczynski  default: tanimoto
+    --k           INT      Per-shard FAISS candidates   default: 5000
+                           Total candidates = k × num_shards before rerank.
+    --top         INT      Final hits to annotate        default: 50
+    --nprobe      INT      IVF cells probed per shard    default: 64
+    --jobs        INT      Shards searched in parallel   default: 1
+                           RAM = jobs × shard_RAM (each ~0.8 GB for 34M, m=16)
+    --out-mode    STRING   combined|per-db|both
+                           combined: one wide TSV
+                           per-db:  separate TSV per database
+                           both:    write both
+    --out         FILE     Base output path for TSV file(s)
+    --no-gpu               Use CPU for FAISS search (recommended; GPU not needed)
+    --profile              Print per-phase timing summary
+
+    Output files (--out results.tsv, --out-mode both):
+      results.tsv              — combined wide table (all database columns)
+      results_enamine.tsv      — Enamine columns only
+      results_npass.tsv        — NPASS-matched hits with NPASS columns
+      results_drugbank.tsv     — DrugBank-matched hits with DrugBank columns
+
+    Multi-query numbering:
+      query 1 → results.tsv
+      query 2 → results_q002.tsv  (and results_q002_enamine.tsv etc.)
+      query N → results_qNNN.tsv
+
+    Session mode (no --query):
+      Loads all indexes once, then loops: enter SMILES → search → ask to continue.
+      Type 'q' or press Ctrl+D to exit.
+
+    Example (non-interactive, all databases):
+      ./search_sharded_database \
+        --config       ../../index/enamine_sharded/shard_config.json \
+        --npass-index  ../../npass \
+        --drugbank-bin ../../index/drugbank/drugbank.bin \
+        --databases    enamine,npass,drugbank \
+        --metric       tanimoto \
+        --k            5000 \
+        --top          50 \
+        --nprobe       64 \
+        --jobs         1 \
+        --out-mode     both \
+        --out          ../../index/enamine_sharded/results.tsv \
+        --no-gpu
+
+  ── search_annotate ──────────────────────────────────────────────────────────
+  (single-index workflow; use search_sharded_database for sharded indexes)
+
+    --query           SMILES   (optional) Query SMILES; if omitted, session mode
+    --faiss           FILE     (required) FAISS index file
+    --enamine         FILE     (required) Original Enamine CXSMILES file
+    --enamine-offsets FILE     (required) enamine.offsets.bin
+    --enamine-header  FILE     (optional) enamine.header.tsv (guessed if omitted)
+    --npass-index     DIR      (optional) Raw NPASS directory (containing NPASS TSV files)
+    --drugbank-bin    FILE     (optional) drugbank.bin (from prepare_drugbank)
+    --databases       STRING   (optional) Comma-separated: enamine,npass,drugbank
+    --out-mode        STRING   combined|per-db|both
+    --metric          STRING   tanimoto|dice|tversky|cosine|kulczynski
+    --k               INT      FAISS candidate pool size    default: 5000
+    --top             INT      Final results to annotate    default: 50
+    --nprobe          INT      FAISS IVF cells to probe     default: 64
+    --radius          INT      Morgan FP radius (must match build) default: 3
+    --nbits           INT      Morgan FP bits  (must match build) default: 4096
+    --out             FILE     Base output path for TSV file(s)
+    --profile                  Print per-phase timing summary at end
+
+================================================================================
+  SECTION 4 — DATA FLOW
+================================================================================
+
+  prepare_enamine:
+    ┌──────────────────────────────────────────────────┐
+    │  fopen(enamine.cxsmiles, "rb")                   │
+    │  fgets(header_line)  →  parse_header()           │
+    │  write enamine.header.tsv                        │
+    │  write enamine.schema.json                       │
+    │  loop:                                           │
+    │    pos = ftell(fin)                              │
+    │    fgets(line)                                   │
+    │    OffsetWriter::write(pos)  →  offsets.bin      │
+    │    mol_count++                                   │
+    │  end loop                                        │
+    │  write enamine.count                             │
+    └──────────────────────────────────────────────────┘
+
+  build_sharded_database:
+    ┌──────────────────────────────────────────────────┐
+    │  system("prepare_enamine --input X --outdir Y")  │
+    │  read enamine.count → total_mols                 │
+    │  compute shard_starts[] and shard_ends[]         │
+    │  resolve GPU/CPU choice (once, interactive)      │
+    │  for each shard i:                               │
+    │    if shard_i/faiss.index exists → skip          │
+    │    mkdir shard_i/                                │
+    │    cmd = "build_enamine_index --input X          │
+    │             --offsets Y --out shard_i/faiss.index│
+    │             --mol-start S --mol-end E            │
+    │             --gpu|--no-gpu ..."                  │
+    │    system(cmd)                                   │
+    │  ShardConfig::save(outdir/shard_config.json)     │
+    └──────────────────────────────────────────────────┘
+
+  build_enamine_index (per shard):
+    ┌──────────────────────────────────────────────────┐
+    │  OffsetStore::open(offsets.bin)  [mmap]          │
+    │  shard range: [mol_start, mol_end)               │
+    │                                                  │
+    │  Phase 1: read train_size SMILES                 │
+    │    fseek(fin, offsets[mol_start + i])            │
+    │    fgets → strip_cxsmiles(first_field())         │
+    │                                                  │
+    │  Phase 2: OMP parallel FP compute                │
+    │    smiles_to_fp_float → tmp[DIM]                 │
+    │    copy to train_mat[slot * DIM]                 │
+    │                                                  │
+    │  Phase 3: GPU or CPU IVFPQ training              │
+    │    if GPU: GpuIndexIVFPQ::train()                │
+    │    else:   IndexIVFPQ::train()   (CPU fallback)  │
+    │                                                  │
+    │  Phase 4: batch loop over [mol_start, mol_end)   │
+    │    for each batch:                               │
+    │      fseek → fgets → strip SMILES  (serial read) │
+    │      OMP parallel: smiles_to_fp_float            │
+    │      compact valid entries                       │
+    │      id_batch[i] = mol_start + mol_cursor + i    │
+    │      index.add_with_ids(ptr, fp_batch, id_batch) │
+    │                                                  │
+    │  Phase 4.5 (GPU only): gpu_index.copyTo(cpu)     │
+    │                                                  │
+    │  Phase 5: faiss::write_index(cpu) → faiss.index  │
+    └──────────────────────────────────────────────────┘
+
+  search_sharded_database (per query):
+    ┌──────────────────────────────────────────────────┐
+    │  Load once per session:                          │
+    │    ShardConfig::load(shard_config.json)          │
+    │    EnamineReader (shared offset file + cxsmiles) │
+    │    NpassIndex::load_from_dir(npass_dir)                   │
+    │    DrugBankIndex::load_binary(drugbank.bin)      │
+    │                                                  │
+    │  Per query:                                      │
+    │    SmilesToMol → MolToSmiles (canonicalize)      │
+    │    Morgan FP → qfp_bv, qvec[DIM]                │
+    │    direct Tanimoto vs NPASS compounds            │
+    │    direct Tanimoto vs DrugBank compounds         │
+    │                                                  │
+    │  Per shard (sequential, or OMP parallel --jobs): │
+    │    faiss::read_index(shard_N/faiss.index)        │
+    │    index.nprobe = nprobe                         │
+    │    index.search(1, qvec, k, D[], I[])            │
+    │    free index                                    │
+    │                                                  │
+    │  Global merge:                                   │
+    │    all shard candidates → sort by D[] ascending  │
+    │    dedup by FAISS ID                             │
+    │    take top candidates                           │
+    │                                                  │
+    │  Exact rerank:                                   │
+    │    for each candidate:                           │
+    │      global mol_id = I[j]                        │
+    │      EnamineReader::fetch(mol_id) → EnamineRecord│
+    │      mol_to_fp_bv → hfp_bv                       │
+    │      score = compute_similarity(qfp_bv, hfp_bv)  │
+    │    sort by score DESC                            │
+    │                                                  │
+    │  Annotate top-N:                                 │
+    │    NpassIndex::lookup(inchikey, canon_smiles)    │
+    │    DrugBankIndex::lookup_by_inchikey(ik)         │
+    │                                                  │
+    │  Write TSV output(s)                             │
+    └──────────────────────────────────────────────────┘
+
+  prepare_npass:
+    ┌──────────────────────────────────────────────────┐
+    │  Load structure.txt → struct_map[np_id]          │
+    │                     → by_inchikey[ik] = [np_ids] │
+    │                     → by_smiles[smi] = [np_ids]  │
+    │  Load other tables via load_tsv_multi/single()   │
+    │  Write 13 binary index files                     │
+    │  Write npass_index.manifest                      │
+    └──────────────────────────────────────────────────┘
+
+================================================================================
+  SECTION 5 — DATA STRUCTURES AND ALGORITHMS
+================================================================================
+
+  ── MmapFile (src/common/mmap_file.hpp) ──────────────────────────────────────
+
+    Internal:
+      const char* data_    — mmap'd base pointer
+      size_t size_          — file size in bytes
+      int fd_               — file descriptor
+
+    mmap call:
+      mmap(nullptr, size_, PROT_READ, MAP_SHARED, fd_, 0)
+    Access hint:
+      madvise(data_, size_, MADV_SEQUENTIAL)  during index build
+      madvise(data_, size_, MADV_RANDOM)      during search (hint_random())
+
+    read_line(uint64_t offset):
+      start = data_ + offset
+      end   = memchr(start, '\n', size_ - offset)   O(line_length)
+      strip \r if present
+      return string(start, end)
+
+    Why mmap over fseek/fread:
+      - Zero-copy: kernel maps file pages directly into address space
+      - Multiple threads can read simultaneously without contention
+      - OS page cache handles repeated access to hot regions
+      - No per-call syscall overhead during search retrieval
+
+  ── OffsetStore (src/enamine/offset_store.hpp) ──────────────────────────────
+
+    Binary format: sequential array of uint64_t (little-endian, native).
+    File size = N_molecules * 8 bytes.
+    For 136M molecules: 136M * 8 = ~1.1 GB.
+
+    Lookup: operator[](mol_id) = data_[mol_id]   — single cache-line read.
+    In the sharded workflow, all shards share ONE offset file.
+    Shard N accesses offsets[mol_start_N .. mol_end_N - 1] only.
+
+    OffsetWriter appends uint64_t values during prepare_enamine.
+    Thread safety: writer is single-threaded; reader is fully concurrent.
+
+  ── ShardConfig (src/common/shard_config.hpp) ────────────────────────────────
+
+    struct ShardEntry { int id; uint64_t mol_start, mol_end; string faiss_path; };
+    struct ShardConfig {
+        uint64_t total_molecules;
+        string cxsmiles_path, offsets_path, header_path;
+        int fp_radius, fp_nbits, nlist, pq_m, pq_nbits;
+        vector<ShardEntry> shards;
+        void save(const string& path) const;   // hand-written JSON
+        void load(const string& path);          // brace-depth parser
+    };
+
+    save() writes formatted JSON; load() parses without a JSON library.
+    The shard_config.json is the single entry point for search_sharded_database.
+
+  ── FAISS IVFPQ ──────────────────────────────────────────────────────────────
+
+    Index type:  IndexIVFPQ (Inverted File with Product Quantization)
+
+    Construction parameters:
+      DIM     = nbits (e.g. 1024)      — fingerprint dimensionality
+      nlist   = number of Voronoi cells (IVF clusters)
+      m       = number of PQ sub-vectors (DIM/m must be integer)
+      pq_nbits= bits per sub-vector (8 → 256 centroids per sub-vector)
+
+    Memory per vector (stored):
+      m * pq_nbits / 8 bytes  =  16 * 8 / 8  =  16 bytes/vector (m=16)
+      vs. DIM * 4 = 1024 * 4  =  4096 bytes raw  (nbits=1024)
+      Compression ratio: 256x for nbits=1024, m=16, pq_nbits=8
+
+    Memory for 34M vectors (one shard, m=16):
+      34M * 16 bytes = ~0.54 GB PQ codes
+      + 34M * 8 bytes = ~0.27 GB mol IDs
+      ≈ 0.8 GB per shard FAISS index
+
+    GPU backend (build_enamine_index):
+      At startup, select_gpu_backend(force) probes for CUDA GPUs.
+      force=-1: interactive prompt; force=1: GPU required; force=0: CPU required.
+      GPU: GpuIndexIVFPQ trains and adds on GPU, copyTo(cpu) before write.
+      CPU: IndexFlatL2 quantizer + IndexIVFPQ, all in RAM.
+      The written faiss.index is always a standard CPU IndexIVFPQ.
+      GPU accelerates build time; search always runs on CPU.
+
+    Search (CPU):
+      index.nprobe = 64;
+      index.search(1, query_vec, k, distances, indices);
+      FAISS IDs returned are global mol_ids (mol_start + local_offset).
+
+    Why L2 distance with binary FP float vectors is a good ANN proxy:
+      For binary vectors {0,1}:
+        L2(a,b)^2 = Hamming(a,b)
+      Hamming is monotonically related to Tanimoto, so FAISS ranking
+      provides good recall for exact Tanimoto rerank.
+
+  ── Morgan Fingerprints (FpConfig: radius, nbits) ────────────────────────────
+
+    RDKit: MorganFingerprints::getFingerprintAsBitVect(mol, radius, nbits)
+
+    radius=3: captures up to 3 bond-hops from each atom center (ECFP6)
+    nbits=1024: good balance; used for the sharded production index.
+
+    Conversion to float vector for FAISS:
+      for i in 0..nbits-1: out[i] = fp.getBit(i) ? 1.0f : 0.0f
+
+    CXSMILES handling:
+      strip_cxsmiles(s): removes " |...|" extension suffix before parsing.
+
+  ── Similarity Metrics ────────────────────────────────────────────────────────
+
+    All implemented via RDKit BitOps on ExplicitBitVect:
+
+    Tanimoto (Jaccard):  |A ∩ B| / |A ∪ B|  = c / (a + b - c)
+    Dice:                2|A ∩ B| / (|A| + |B|)  = 2c / (a + b)
+    Tversky(α=0.7,β=0.3): c / (α*|A\B| + β*|B\A| + c)
+    Cosine:              CosineSimilarity(a,b)  (RDKit built-in)
+    Kulczynski:          (c/a + c/b) / 2
+
+  ── NpassIndex (src/npass/npass_index.hpp) ───────────────────────────────────
+
+    In-memory structure:
+      unordered_map<string, vector<string>> by_inchikey_
+      unordered_map<string, vector<string>> by_smiles_
+      unordered_map<string, NpassRow> generalinfo_, targets_, species_info_
+      unordered_map<string, vector<NpassRow>> activities_by_npid_,
+        toxicity_by_npid_, species_pair_by_npid_, coculture_, elicitation_,
+        engineer_, symbiont_
+
+    Lookup:
+      1. search by_inchikey_[inchikey] → np_ids
+      2. if empty: search by_smiles_[canon_smiles] → np_ids
+      3. for each np_id: build_record(np_id) → NpassCompound
+
+    Memory estimate (NPASS 3.0, ~80K compounds): ~450-600 MB total.
+
+  ── TSV parsing (src/common/tsv_utils.hpp) ───────────────────────────────────
+
+    split_tsv(string_view line, vector<string_view>& out):
+      Linear scan for '\t' characters. Returns string_view slices (zero-copy).
+
+    strip_cxsmiles(string_view):
+      Returns prefix before first space. e.g. "CC1=CC=CC=C1 |c:1,3,5|" → "CC1=CC=CC=C1"
+
+================================================================================
+  SECTION 6 — INPUT/OUTPUT FILE FORMATS
+================================================================================
+
+  ── Enamine CXSMILES (.cxsmiles) ─────────────────────────────────────────────
+
+    Format: tab-separated, first line is header.
+    Encoding: UTF-8 (ASCII subset in practice).
+    Line ending: LF or CRLF.
+
+    Columns (19 total):
+      smiles           CXSMILES string (may have "|...|" extension)
+      id               Enamine compound ID
+      MW               molecular weight
+      HAC              heavy atom count
+      sLogP            calculated logP
+      HBA              H-bond acceptors
+      HBD              H-bond donors
+      RotBonds         rotatable bonds
+      FSP3             fraction sp3 carbons
+      TPSA             topological polar surface area
+      QED              quantitative estimate of drug-likeness
+      lead-like        boolean flag
+      350/3_lead-like  boolean flag
+      fragments        boolean flag
+      strict_fragments boolean flag
+      PPI_modulators   boolean flag
+      natural_product-like boolean flag
+      Type             compound type string
+      InChiKey         InChIKey string (note: "InChiKey" not "InChIKey")
+
+  ── enamine.offsets.bin ──────────────────────────────────────────────────────
+
+    Binary flat file. Native endianness (little-endian on x86-64).
+    Layout:
+      [uint64_t offset_0]  [uint64_t offset_1]  ...  [uint64_t offset_{N-1}]
+    File size: N_molecules * 8 bytes.
+
+    offset_i = byte position of the i-th data line in the Enamine file.
+    In the sharded workflow, FAISS ID for molecule i = i (global index).
+    A single offset file serves all shards.
+
+  ── FAISS index (faiss.index) ────────────────────────────────────────────────
+
+    FAISS native binary format (platform-dependent but stable).
+    Contains: IVF cluster centroids, PQ codebooks, encoded vectors, ID map.
+    Size estimate for 34M molecules, m=16, nbits=1024:
+      ~0.8-1.0 GB per shard file
+
+  ── NPASS binary index files ─────────────────────────────────────────────────
+
+    inchikey_index.bin:
+      uint64_t N_entries (sorted ascending by InChIKey)
+      for each entry:
+        char[27]  inchikey  (padded with \0 to 27 bytes)
+        uint32_t  num_npids
+        for each:  uint16_t len, char[len]  (np_id string)
+
+    smiles_index.bin:
+      uint64_t N_entries (sorted ascending by SMILES string)
+      for each entry:
+        uint16_t smiles_len, char[smiles_len]
+        uint32_t num_npids
+        for each:  uint16_t len, char[len]
+
+    Other binary files: single- and multi-value tables keyed by np_id.
+
+  ── Results TSV format ───────────────────────────────────────────────────────
+
+    results.tsv (combined mode):
+      Header: rank  mol_id  score  faiss_dist  metric  query_smiles  hit_smiles
+              <all 19 Enamine columns>
+              npass_matched  npass_np_ids
+              drugbank_matched  drugbank_db_ids
+
+    results_enamine.tsv:
+      All Enamine hits with all 19 Enamine column values.
+
+    results_npass.tsv:
+      NPASS-matched hits; columns include dynamic generalinfo fields.
+
+    results_drugbank.tsv:
+      DrugBank-matched hits; fixed DrugBank column set.
+
+    npass_np_ids: semicolon-separated list of np_id strings.
+    drugbank_db_ids: semicolon-separated DrugBank IDs.
+
+================================================================================
+  SECTION 7 — MEMORY USAGE MODEL
+================================================================================
+
+  prepare_enamine:
+    Peak RAM: ~1 MB (one line buffer, offset writer buffer)
+    Disk I/O: sequential read of entire Enamine file
+
+  build_enamine_index (per shard, 34M molecules, nbits=1024):
+    Phase 1 (read SMILES): train_size * ~100 bytes = 500K * 100 = ~50 MB
+    Phase 2 (compute FPs): train_size * nbits * 4 bytes
+                           = 500K * 1024 * 4 = ~2 GB
+                           Freed before Phase 3.
+    Phase 4 (add batches):
+      fp_batch: batch_size * nbits * 4 = 1M * 1024 * 4 = ~4 GB (peak)
+      Total peak during add: ~4 GB + FAISS index in RAM (~0.5 GB growing)
+
+  build_sharded_database:
+    Only shell overhead; runs each build_enamine_index as a subprocess.
+    Peak RAM = single shard build RAM (shards built sequentially by default).
+
+  search_sharded_database (per query, 4 shards × 34M, m=16):
+    FAISS index loaded (one at a time):    ~0.8 GB per shard
+    Global offset file mmap'd:             ~1.1 GB (shared)
+    NPASS in RAM:                          ~450-600 MB
+    DrugBank in RAM:                       ~82 MB
+    Candidate buffers:                     4 × k × 12 bytes ≈ 240 KB (k=5000)
+    Total resident (jobs=1):               ~2.5 GB
+
+    With --jobs 4 (all 4 shards parallel):
+      4 × 0.8 GB FAISS + 1.1 GB offsets + NPASS + DrugBank ≈ 5.4 GB
+
+  Reducing RAM for build:
+    Lower train_size (e.g. 100K): Phase 2 drops to ~0.4 GB
+    Lower batch_size (e.g. 500K): Phase 4 drops to ~2 GB
+    Lower m (e.g. 8):             FAISS index halves
+
+================================================================================
+  SECTION 8 — NPASS JOIN STRATEGY
+================================================================================
+
+  Primary key:  InChIKey exact match
+    Enamine hit.InChiKey  →  NpassIndex.by_inchikey_[ik]  →  [np_id, ...]
+
+  Fallback key: canonical SMILES exact match
+    Enamine hit canonical SMILES  →  NpassIndex.by_smiles_[smi]  →  [np_id, ...]
+
+  For each matched np_id, build_record() performs:
+
+    activities join:
+      activities_by_npid_[np_id] → vector<NpassRow>
+      for each row: targets_[row["target_id"]] → target NpassRow
+
+    toxicity join:
+      toxicity_by_npid_[np_id] → vector<NpassRow>
+      for each row: targets_[row["target_id"]] → target NpassRow
+
+    species_pair join:
+      species_pair_by_npid_[np_id] → vector<NpassRow>
+      for each row: species_info_[row["org_id"]] → species NpassRow
+
+    Direct tables (no join needed):
+      coculture, elicitation, engineer, symbiont
+
+  All original column names are preserved in NpassRow (unordered_map).
+
+================================================================================
+  SECTION 9 — SHARDING ARCHITECTURE
+================================================================================
+
+  Design principles:
+    - No CXSMILES duplication: one original file serves all shards.
+    - One global offset file: shard N accesses offsets[mol_start..mol_end).
+    - Global mol_ids in FAISS: ID = mol_start + local_index.
+      EnamineReader::fetch(global_id) works identically across shards.
+    - shard_config.json: single entry point for search_sharded_database.
+    - Re-runnable builds: shards with existing faiss.index are skipped.
+
+  Production configuration (Enamine REAL 136M):
+    4 shards × ~34M molecules each
+    nbits=1024, nlist=4096, m=16, pq_nbits=8
+    train_size=500000 (122× the nlist requirement of 30×nlist=122,880)
+    Training molecules: first 500K molecules of each shard (sequential, not random)
+    GPU or CPU: build_sharded_database asks once, passes --gpu/--no-gpu to all shards
+    Measured build time (GPU): ~8-9 min per shard on an RTX-class GPU
+
+  Shard directory layout:
+    index/enamine_sharded/
+      shard_config.json           ← single metadata file
+      enamine.offsets.bin         ← shared global offset file (1.1 GB)
+      enamine.header.tsv
+      enamine.schema.json
+      enamine.count
+      shard_001/faiss.index       ← molecules [0, 34M)   (~0.8 GB)
+      shard_002/faiss.index       ← molecules [34M, 68M)
+      shard_003/faiss.index       ← molecules [68M, 102M)
+      shard_004/faiss.index       ← molecules [102M, 136M)
+
+  Search behavior with --jobs N:
+    OMP parallel_for over shards in batches of N.
+    Each job independently loads its FAISS index, searches, then frees it.
+    Results from all shards merged by FAISS L2 distance (ascending), then
+    deduplicated by mol_id, then exact Tanimoto reranked.
+    --jobs 1: ~2.5 GB resident RAM, serial shard search (safe default)
+    --jobs 4: ~5.4 GB resident RAM, all shards searched simultaneously (~4× faster)
+
+  Scaling to larger datasets:
+    30B molecules → 221 shards × 136M  (see SCALE_GUIDE.txt)
+    Shard size can be tuned via --mols-per-shard instead of --num-shards.
+    Recommended nlist per shard: sqrt(N_shard) to 4×sqrt(N_shard).
+    136M/shard → nlist 4096-16384.
+
+================================================================================
+  SECTION 10 — PERFORMANCE PARAMETERS AND TUNING
+================================================================================
+
+  ── nprobe vs recall ─────────────────────────────────────────────────────────
+
+    nprobe=1:   very fast, low recall (~40-60%)
+    nprobe=16:  fast, moderate recall (~70-80%)
+    nprobe=64:  default, good recall (~85-90%)
+    nprobe=128: slower, high recall (~92-95%)
+    nprobe=256: slow, very high recall (~96-98%)
+    nprobe=nlist: exact IVF search
+
+    Recommendation: nprobe=64 for discovery, nprobe=256 for high-sensitivity.
+
+  ── k vs reranking cost ───────────────────────────────────────────────────────
+
+    k=500:   fast rerank, may miss relevant hits in large diverse db
+    k=2000:  balanced
+    k=5000:  default; good recall (--k is per-shard; total = k × num_shards)
+    k=10000: high recall; more rerank time
+
+    Rerank cost scales linearly with total candidates × (RDKit FP time per mol).
+
+  ── nbits and radius ─────────────────────────────────────────────────────────
+
+    radius=2, nbits=2048:  ECFP4, lower resolution, faster FP
+    radius=3, nbits=1024:  production default for sharded index
+    radius=3, nbits=4096:  higher quality, more RAM
+
+    nbits MUST be consistent between build_enamine_index and search.
+    shard_config.json records fp_radius and fp_nbits; search_sharded_database
+    reads them automatically.
+
+  ── PQ compression settings ──────────────────────────────────────────────────
+
+    m (sub-vectors) × pq_nbits (bits/sub-vector):
+      m must divide DIM evenly: DIM % m == 0
+
+    DIM=1024, m=16, pq_nbits=8:
+      bytes/vector = 16   (production default for sharded index)
+
+    DIM=1024, m=8, pq_nbits=8:
+      bytes/vector = 8   (compact; lower quality, fits more shards in RAM)
+
+    Recommendation: m=DIM/64 for balanced, m=DIM/128 for compact.
+
+  ── I/O strategy for huge files ──────────────────────────────────────────────
+
+    During build_enamine_index:
+      Reads are sequential (offsets are monotone within a shard).
+      On NVMe: fast sequential I/O; on HDD: acceptable for build.
+
+    During search_sharded_database (retrieval phase):
+      k=5000 random reads from a 100-200 GB file.
+      On NVMe SSD: 5000 reads * ~10 µs = ~50ms I/O.
+      On HDD: ~50s (prohibitive; use SSD/NVMe for search).
+
+================================================================================
+  SECTION 11 — PROGRESS REPORTING FORMAT
+================================================================================
+
+  All progress is written to stderr; results to stdout.
+
+  Phase banner (printed once at phase start):
+    [PHASE] Phase N: description  (total: X.XXM items)
+
+  In-progress bar (updated at ~10 Hz via \r):
+    \r  [====>...............] Phase N: description  45.3%  12.34M / 27.20M mol  |  1.23M/s  |  ETA 12m 34s
+
+  Spinner (for unknown-duration phases like FAISS training):
+    [PHASE] Phase 3: FAISS IVFPQ training
+    \r  [|]  Phase 3: FAISS IVFPQ training                    1m 23s
+
+  Progress classes: src/common/progress.hpp
+    Progress      — standard bar with known total
+    ProgressBytes — byte-unit bar (for file I/O progress)
+    Spinner       — animated spinner for blocking calls
+
+================================================================================
+  SECTION 12 — BUILD SYSTEM
+================================================================================
+
+  CMakeLists.txt:
+    cmake_minimum_required: 3.16
+    C++ standard: 20  (required for RDKit ranges, constexpr destructors)
+    Compile flags: -O3 -march=native -funroll-loops -ffast-math
+    CONDA_PREFIX: must be set (activate conda env chem_cpp before cmake)
+
+  Dependencies (from conda env chem_cpp):
+    RDKit:     $CONDA_PREFIX/include/rdkit/
+               libRDKitGraphMol, libRDKitSmilesParse, libRDKitRDGeneral,
+               libRDKitFingerprints, libRDKitDataStructs, libRDKitMolStandardize
+    FAISS-GPU: libfaiss (cuda129_mkl build; includes GPU headers at
+               $CONDA_PREFIX/include/faiss/gpu/)
+               libcublas, libcudart (linked transitively via libfaiss)
+    OpenMP:    libgomp (via find_package(OpenMP))
+    CUDA SDK:  /usr/local/cuda/include  (cublas_v2.h etc.; detected by CMake)
+
+  Build commands:
+    conda activate chem_cpp
+    cd BSCS/build
+    cmake .. -DCMAKE_BUILD_TYPE=Release
+    make -j$(nproc)
+
+  Output executables (in build/):
+    prepare_enamine             (~39 KB)
+    build_enamine_index         (~66 KB)
+    prepare_npass               (~163 KB)
+    prepare_drugbank            (~150 KB)
+    search_annotate             (~190 KB)
+    build_sharded_database      (~50 KB)
+    search_sharded_database     (~200 KB)
+
+================================================================================
+  SECTION 13 — COMPLETE EXAMPLE RUN (SHARDED WORKFLOW)
+================================================================================
+
+  These are the variables from build/config.sh (fill in your actual paths):
+    ENAMINE      = /path/to/Enamine_REAL_DB.cxsmiles
+    IDIR         = /path/to/index
+    NPASS_RAW    = /path/to/npass
+    DRUGBANK_XML = /path/to/drugbank.xml   (optional)
+    DRUGBANK_BIN = /path/to/drugbank.bin   (optional, if already built)
+    BUILD        = (auto-detected from script location)
+
+  ── Step 1: Build all indexes (run once; use build_full_sharded.sh) ──────────
+
+    cd $BUILD
+    ./build_full_sharded.sh
+
+    # This script:
+    #   1. Indexes NPASS (skips if $IDIR/npass/ already has files)
+    #   2. Indexes DrugBank (skips if $IDIR/drugbank/drugbank.bin exists)
+    #   3. Calls build_sharded_database for 4-shard Enamine index
+    #      (skips any shard whose faiss.index already exists)
+    #
+    # Alternatively, run each step manually:
+
+  ── Step 1a: Prepare NPASS index (fast, ~5-30 s) ────────────────────────────
+
+    mkdir -p $IDIR/npass
+    ./prepare_npass \
+      --npass-dir $NPASS \
+      --outdir    $IDIR/npass
+
+  ── Step 1b: Prepare DrugBank index (~12 s) ──────────────────────────────────
+
+    mkdir -p $IDIR/drugbank
+    ./prepare_drugbank \
+      --xml    $DRUGBANK_XML \
+      --outdir $IDIR/drugbank
+    # Output: $IDIR/drugbank/drugbank.bin (~82 MB)
+
+  ── Step 1c: Build 4-shard Enamine FAISS index (~8-10 h CPU, ~35 min GPU) ──
+
+    ./build_sharded_database \
+      --input        $ENAMINE \
+      --outdir       $IDIR/enamine_sharded \
+      --num-shards   4 \
+      --radius       3 \
+      --nbits        1024 \
+      --nlist        4096 \
+      --m            16 \
+      --nbits-pq     8 \
+      --train-size   500000 \
+      --batch        1000000 \
+      --threads      12 \
+      --yes
+
+    # Asks GPU/CPU preference once; then builds shards sequentially.
+    # Each shard ~8-9 min on GPU, ~2-3 h on CPU.
+    # Safe to interrupt: re-running skips completed shards automatically.
+
+    Output:
+      $IDIR/enamine_sharded/shard_config.json
+      $IDIR/enamine_sharded/enamine.offsets.bin  (~1.1 GB)
+      $IDIR/enamine_sharded/shard_001/faiss.index  (~0.8 GB)
+      $IDIR/enamine_sharded/shard_002/faiss.index  (~0.8 GB)
+      $IDIR/enamine_sharded/shard_003/faiss.index  (~0.8 GB)
+      $IDIR/enamine_sharded/shard_004/faiss.index  (~0.8 GB)
+
+  ── Step 2: Run searches (use search_full_sharded.sh or manual) ──────────────
+
+    # Session mode (interactive, loads indexes once then loops on queries):
+    ./search_full_sharded.sh
+
+    # Single query, non-interactive:
+    ./search_sharded_database \
+      --config       $IDIR/enamine_sharded/shard_config.json \
+      --npass-index  $NPASS_RAW \
+      --drugbank-bin $IDIR/drugbank/drugbank.bin \
+      --query        "c1ccc2c(c1)sc1ccccc12" \
+      --databases    enamine,npass,drugbank \
+      --metric       tanimoto \
+      --k            5000 \
+      --top          50 \
+      --nprobe       64 \
+      --jobs         1 \
+      --out-mode     both \
+      --out          $IDIR/enamine_sharded/results.tsv \
+      --no-gpu
+
+    Output:
+      results.tsv              — combined table (50 hits × all columns)
+      results_enamine.tsv      — Enamine columns only
+      results_npass.tsv        — NPASS-matched hits
+      results_drugbank.tsv     — DrugBank-matched hits
+
+    Typical timing (NVMe SSD, GPU build, CPU search, 4 shards × 34M):
+      Index load (first query):  ~0.5 s (NPASS + DrugBank + shard_config)
+      Per shard FAISS search:    ~50-200 ms per shard (4 × = ~200-800 ms)
+      Enamine retrieval:         ~100-300 ms (5000 × 4 = 20K random mmap reads)
+      Exact Tanimoto rerank:     ~200-500 ms (20K FP computations)
+      Annotation:                ~5 ms
+      Total per query:           ~600 ms - 1.5 s
+
+================================================================================
+  SECTION 14 — DRUGBANK INTEGRATION
+================================================================================
+
+  Source data
+  ───────────
+  drugbank.xml    DrugBank Full Database export (XML, ~2.4 GB, 19,857 drugs)
+  drugbank.bin    Binary index written by prepare_drugbank (~82 MB)
+
+  Parsed fields per drug
+  ──────────────────────
+  Identifiers:
+    drugbank_id (primary, e.g. "DB00001"), alt_ids[], drug_type, name,
+    cas_number, unii, state
+
+  Pharmacology text (all stored verbatim):
+    description, indication, pharmacodynamics, mechanism_of_action, toxicity,
+    metabolism, absorption, half_life, protein_binding, route_of_elimination,
+    volume_of_distribution, clearance, synthesis_reference
+
+  Classification (from <classification>):
+    classif_direct_parent, classif_kingdom, classif_superclass,
+    classif_class, classif_subclass
+
+  Structure (from <calculated-properties>):
+    inchikey, smiles, inchi, molecular_formula, molecular_weight, logp
+    Note: ~26% of drugs (large biotechs, proteins) have no calculated structure.
+
+  Lists:
+    groups[]       e.g. ["approved", "withdrawn"]
+    synonyms[]     alternative drug names
+    categories[]   MeSH category names
+
+  Protein actors (each: id, name, organism, actions[], known_action,
+                        polypeptide_id, polypeptide_source, gene_name,
+                        general_function, specific_function, cellular_location,
+                        chromosome_location, locus, molecular_weight, pi):
+    targets[]      pharmacological targets
+    enzymes[]      metabolic enzymes
+    transporters[] membrane transporters
+    carriers[]     plasma protein carriers
+
+  XML parser design
+  ─────────────────
+  File: src/drugbank/drugbank_index.hpp (header-only)
+
+  Custom SAX-style streaming tokenizer:
+  - BufR:      64 KB buffered FILE* reader, single-char unget
+  - next_tok:  character-level state machine producing OPEN/CLOSE/SELF_CLOSE/TEXT
+  - xml_decode: handles &amp; &lt; &gt; &quot; &apos; &#13; (CR stripped)
+  - Collecting mode: TEXT tokens from inline sub-elements accumulated into one buffer.
+  - Path tracking: depth counter + drug_depth/target_depth/poly_depth anchors.
+
+  Binary format (drugbank.bin)
+  ────────────────────────────
+  Header:  uint32_t magic=0x44424958 ('DBIX'), uint32_t drug_count
+  Per drug: 30 string fields (uint16_t len + bytes each),
+            4 list fields, 4 target-list fields
+  Per target record: 14 string fields + 1 actions list
+  Total size: ~82 MB for 19,857 drugs
+  Load time: <0.3 s  (method: DrugBankIndex::load_binary())
+
+  Lookup strategy
+  ───────────────
+  by_inchikey_: std::unordered_map<string, size_t> built at load time.
+  lookup_by_inchikey(key): O(1) average.
+  lookup_by_canon_smiles(smi): fallback when InChIKey is absent.
+  Drugs with no InChIKey (biotechs) are not in the InChIKey map.
+
+  Integration in search_sharded_database / search_annotate
+  ─────────────────────────────────────────────────────────
+  Flag: --drugbank-bin /path/to/drugbank.bin
+  Annotation phase: for each Enamine hit, extract InChIKey.
+  Call drugbank.lookup_by_inchikey(ik) → const DrugBankDrug* (or nullptr).
+  Fallback: lookup_by_canon_smiles(canon_smi).
+
+  TSV output adds columns:
+    drugbank_matched    drugbank_db_ids (semicolon-separated)
+
+  Coverage notes
+  ──────────────
+  InChIKey match rate for Enamine hits: very low (Enamine contains novel
+  building blocks, not approved drugs). DrugBank annotation is most useful
+  for query molecules that are known drugs or close analogs.
+
+  Full-file stats:
+    19,857 total drugs
+    14,630 (73.7%) have InChIKey / SMILES (small molecules)
+     5,227 (26.3%) are biotechs with no calculated structure
+    10,033 (50.5%) have at least one protein target
+
+================================================================================
+  END OF ARCHITECTURE DOCUMENT
+================================================================================

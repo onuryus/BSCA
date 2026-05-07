@@ -1,442 +1,381 @@
-# Billion-Scale Chemical Similarity Search
-
-A high-performance chemical search engine built with C++, RDKit and FAISS for million to billion scale molecular libraries.
-
-It uses Morgan fingerprints, FAISS IVFPQ indexing, and exact reranking with multiple similarity metrics.
-
-
-## Features
-
-- Morgan fingerprint generation with RDKit
-- FAISS IVFPQ approximate nearest neighbor search
-- Streaming index construction for large libraries
-- Offset-based SMILES retrieval
-- Exact reranking with:
-  - Tanimoto
-  - Dice
-  - Tversky
-  - Cosine
-  - Kulczynski
-- Search-time tuning with:
-  - `--metric`
-  - `--k`
-  - `--nprobe` 
-## How it works
-
-text
-SMILES
-  -> RDKit molecule
-  -> Morgan fingerprint (2048-bit)
-  -> float vector conversion
-  -> FAISS IVFPQ indexing
-  -> approximate candidate retrieval
-  -> exact similarity reranking
-
-
-<p align="center"> <img src="pic/model.png" width="700"/> </p> 
-
-
-
-<h2>How it works</h2>
-
-<p>
-This system combines cheminformatics with large-scale vector search to perform fast chemical similarity search over million- to billion-scale molecular libraries. Molecules are read as SMILES strings, converted into RDKit molecular objects, and then transformed into fixed-length Morgan fingerprints. These fingerprints are used as the searchable representation of each molecule.
-</p>
-
-<p>
-To make search scalable, the system uses <strong>FAISS IVFPQ</strong> (<em>Inverted File Index + Product Quantization</em>). Instead of comparing every query against every molecule in the database, the vector space is first divided into many coarse regions, and search is restricted to only the most relevant ones.
-</p>
-
-<h3>1. Molecular representation</h3>
-
-<p>Each molecule follows the pipeline below:</p>
-
-<pre><code>SMILES -&gt; RDKit molecule -&gt; Morgan fingerprint (2048-bit) -&gt; vector
-</code></pre>
-
-<ul>
-  <li>Morgan fingerprints encode local chemical environments around atoms.</li>
-  <li>Each molecule is represented with the same fixed dimensionality.</li>
-  <li>This makes the data suitable for efficient indexing and retrieval.</li>
-</ul>
-
-<h3>2. FAISS IVFPQ indexing</h3>
-
-<p>
-The core indexing method is IVFPQ, which combines two ideas: first reducing the search space with clustering, and then compressing vectors for memory-efficient storage.
-</p>
-
-<h4>2.1 Inverted File Index (IVF)</h4>
-
-<p>
-In the IVF stage, the vector space is partitioned into many coarse clusters using a centroid-based method such as k-means. You can think of this as dividing a large city into neighborhoods. Each molecule vector is assigned to the closest centroid, so similar vectors tend to end up in the same region.
-</p>
-
-<pre><code>Vector space -&gt; coarse clusters -&gt; each molecule assigned to nearest cluster
-</code></pre>
-
-<p>
-This means the system no longer needs to search the entire database for every query. Instead, it searches only a limited number of relevant clusters, which dramatically reduces computation.
-</p>
-
-<h4>2.2 Residual encoding</h4>
-
-<p>
-After assigning a vector to a centroid, the system does not necessarily store only the full original vector directly. Instead, it can represent the vector relative to its assigned centroid:
-</p>
-
-<pre><code>residual = vector - centroid
-</code></pre>
-
-<p>
-This residual representation is more compact and often easier to compress accurately, because it captures the local difference inside a cluster rather than the entire global position in the full vector space.
-</p>
-
-<h4>2.3 Product Quantization (PQ)</h4>
-
-<p>
-To further reduce memory usage, each residual vector is split into multiple smaller sub-vectors. For example, a vector can be divided into <code>m</code> parts. Each part is then quantized independently by assigning it to the nearest codeword from a learned codebook.
-</p>
-
-<pre><code>vector/residual -&gt; split into m sub-vectors -&gt; each sub-vector quantized separately
-</code></pre>
-
-<p>
-Instead of storing full floating-point values, the system stores compact PQ codes. This greatly reduces storage requirements and makes it possible to keep extremely large indexes in memory-efficient form.
-</p>
-
-<p>
-In simple terms:
-</p>
-
-<ul>
-  <li><strong>IVF</strong> decides <em>which neighborhood</em> to search.</li>
-  <li><strong>PQ</strong> compresses the vectors inside that neighborhood.</li>
-</ul>
-
-<h3>3. Index construction</h3>
-
-<p>
-The index is built in a streaming manner so that very large datasets can be processed without loading the entire library into memory at once.
-</p>
-
-<ul>
-  <li>Read molecules batch by batch from the SMILES file</li>
-  <li>Convert each molecule into a Morgan fingerprint</li>
-  <li>Transform the fingerprint into a vector representation</li>
-  <li>Assign the vector to its nearest IVF cluster</li>
-  <li>Compress the vector using PQ</li>
-  <li>Insert the compressed representation into the FAISS index</li>
-  <li>Store the file offset of the original molecule for later retrieval</li>
-</ul>
-
-<p>
-Storing file offsets is important because it allows the engine to retrieve the original molecule information directly from disk without duplicating the full raw dataset in RAM.
-</p>
-
-<h3>4. Search pipeline</h3>
-
-<p>
-At query time, the system follows a multi-stage retrieval strategy that combines fast approximate search with exact chemical reranking.
-</p>
-
-<h4>4.1 Query encoding</h4>
-
-<pre><code>Query SMILES -&gt; RDKit molecule -&gt; Morgan fingerprint -&gt; vector
-</code></pre>
-
-<p>
-The query molecule is converted into the same representation as the indexed molecules.
-</p>
-
-<h4>4.2 Cluster selection with <code>nprobe</code></h4>
-
-<p>
-The query vector is compared against the coarse centroids, and only the closest clusters are searched. The number of clusters searched is controlled by <code>nprobe</code>.
-</p>
-
-<ul>
-  <li>Higher <code>nprobe</code> = better recall, but slower search</li>
-  <li>Lower <code>nprobe</code> = faster search, but may miss some relevant candidates</li>
-</ul>
-
-<p>
-This parameter allows the user to balance speed and accuracy depending on the application.
-</p>
-
-<h4>4.3 Approximate nearest neighbor retrieval</h4>
-
-<p>
-Once the relevant clusters are selected, FAISS scans only those clusters and uses the PQ-compressed vectors to estimate similarity quickly. Instead of searching all molecules, it returns only the top candidate set.
-</p>
-
-<pre><code>~1 billion molecules -&gt; restricted clusters -&gt; top-k approximate candidates
-</code></pre>
-
-<p>
-For example, a billion-molecule database may be reduced to only a few thousand candidate molecules during this stage.
-</p>
-
-<h4>4.4 Exact reranking</h4>
-
-<p>
-The approximate FAISS stage is very fast, but the final ranking should reflect true chemical similarity. For this reason, the candidate molecules are retrieved and rescored using exact similarity metrics such as Tanimoto.
-</p>
-
-<pre><code>Tanimoto = (A ∩ B) / (A ∪ B)
-</code></pre>
-
-<p>
-This final reranking step combines the speed of approximate vector search with the chemical interpretability and accuracy of exact fingerprint-based similarity scoring.
-</p>
-
-<h3>5. Why this approach works</h3>
-
-<ul>
-  <li><strong>RDKit</strong> provides robust chemical fingerprint generation.</li>
-  <li><strong>IVF</strong> reduces the search space by dividing the database into coarse regions.</li>
-  <li><strong>PQ</strong> compresses vectors for efficient storage and fast scanning.</li>
-  <li><strong>FAISS ANN search</strong> quickly retrieves a manageable candidate set.</li>
-  <li><strong>Exact reranking</strong> restores chemically meaningful ranking quality.</li>
-</ul>
-
-<p>
-The overall idea is simple: do not brute-force compare a query against every molecule. First narrow the search to the most relevant regions of the space, then retrieve approximate candidates efficiently, and finally apply exact chemical similarity scoring only where it matters.
-</p>
-
-<h3>6. End-to-end pipeline</h3>
-
-<pre><code>SMILES
-  -&gt; RDKit molecule
-  -&gt; Morgan fingerprint
-  -&gt; vector conversion
-  -&gt; FAISS IVFPQ indexing
-
-Query
-  -&gt; encode query molecule
-  -&gt; search nearest clusters
-  -&gt; retrieve top-k approximate candidates
-  -&gt; exact similarity reranking
-  -&gt; final ranked results
-</code></pre>
-
-<p>
-This hybrid design enables scalable billion-scale molecular similarity search with practical memory usage and query times on the order of about one second per query on CPU.
-</p>
-
-
-
-
-## ⚙️ Installation
-
-### 1. Create environment
-
-```bash
-mamba create -n chem_cpp \
-  -c conda-forge \
-  python=3.10 \
-  cmake make gcc gxx \
-  boost-cpp eigen \
-  faiss-cpu \
-  -y
-
-conda activate chem_cpp
-
-
-
-git clone https://github.com/rdkit/rdkit.git
-cd rdkit
-mkdir build && cd build
-
-cmake \
-  -DRDK_BUILD_PYTHON_WRAPPERS=OFF \
-  -DRDK_INSTALL_INTREE=OFF \
-  -DRDK_BUILD_FREETYPE_SUPPORT=OFF \
-  -DRDK_BUILD_CAIRO_SUPPORT=OFF \
-  -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX \
-  ..
-
-make -j$(nproc)
-make install
-
-
-cd ../..
-
-git clone https://github.com/onuryus/BSCS.git
-cd BSCS
-
-rm -rf build
-mkdir build && cd build
-
-cmake ..
-make -j$(nproc)
-```
-
-##  Usage
-
-### 1. Prepare data
-
-The input file must be a SMILES file named `tam.smi` and placed inside the `data` directory:
-
-```bash
-data/tam.smi
-```
-To run the build_index or search_index programs, navigate to the build directory and execute the commands below:
-
-```bash
-./build_index \
-  --radius 3 \
-  --nbits 4096 \
-  --batch 100000
-
-./search_index \
-  --radius 3 \
-  --nbits 4096 \
-  --metric tanimoto \
-  --k 5000 \
-  --nprobe 64
-
-SMILES (exit ile cik): CC1=CC=CC=C1
-```
-
---radius	Morgan fingerprint radius (recommended: 2–3)
---nbits	Fingerprint size (1024, 2048, 4096)
---batch	Batch size (controls RAM vs speed)
-
-
---radius	Must match build step 
---nbits	Must match build step 
---metric	Similarity metric
---k	Number of candidates
---nprobe	FAISS search depth
-
-
-
-1. On the first run, build the index file  
-2. Then, run the search program
-
-
-Other metrics and an example
-
-```bash
---metric tanimoto
---metric dice
---metric tversky
---metric cosine
---metric kulczynski
-./search_index --metric dice --k 3000 --nprobe 64
-```
-
-
-
-###Output
-After the search process is completed, the results are automatically saved to a file named <code>result.txt</code> inside the <code>build/</code> directory.
-
-
-<pre><code>build/result.txt
-</code></pre>
-
-This file contains the ranked search results, including molecule IDs, similarity scores, and corresponding SMILES strings.
-
-
-<table>
-  <thead>
-    <tr>
-      <th>Parameter</th>
-      <th>Description</th>
-      <th>Effect on Accuracy</th>
-      <th>Effect on Speed</th>
-      <th>Default</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><code>--metric</code></td>
-      <td>Similarity metric used for reranking results</td>
-      <td>High (defines final ranking)</td>
-      <td>Low impact</td>
-      <td><code>tanimoto</code></td>
-    </tr>
-    <tr>
-      <td><code>--k</code></td>
-      <td>Number of candidates retrieved from FAISS before reranking</td>
-      <td>Higher → better recall</td>
-      <td>Higher → slower reranking</td>
-      <td><code>5000</code></td>
-    </tr>
-    <tr>
-      <td><code>--nprobe</code></td>
-      <td>Number of clusters searched in FAISS (IVF search scope)</td>
-      <td>Higher → better accuracy</td>
-      <td>Higher → slower search</td>
-      <td><code>32</code></td>
-    </tr>
-  </tbody>
-</table>
-
-
-
-
-
-
-## 📊 Performance
-
-###  Summary 
-
-Tested on ~1 billion molecules:
-
-##  Performance
-
-### 📈  Summary
-
-<table>
-<tr>
-<td width="50%" valign="top">
-
-###  Summary
-
-<table>
-  <thead>
-    <tr>
-      <th>Metric</th>
-      <th>Value</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>Dataset size</td>
-      <td>~1 Billion molecules</td>
-    </tr>
-    <tr>
-      <td>Index build time</td>
-      <td>~14 hours (one-time cost)</td>
-    </tr>
-    <tr>
-      <td>Query time</td>
-      <td>~1 second per query (CPU only)</td>
-    </tr>
-    <tr>
-      <td>Memory usage</td>
-      <td>~12–14 GB RAM</td>
-    </tr>
-  </tbody>
-</table>
-
-</td>
-
-<td width="50%" valign="top">
-
-### 📈
+# BSCA
+Billion-Scale Chemical Annotation
+
+BSCA is a GPU-accelerated billion-scale chemical similarity search and biological annotation platform built with RDKit, FAISS, and memory-mapped indexing. (It's based on our previous project, BSCS)
+
+The system is designed for ultra-large molecular databases ranging from millions to tens of billions of compounds while supporting fast approximate nearest neighbor retrieval, exact chemical reranking, and biological enrichment through NPASS and DrugBank integration.
+
+BSCA supports:
+
+- Billion-scale molecular similarity search
+- FAISS IVF-PQ compressed vector indexing
+- Exact RDKit similarity reranking
+- Memory-mapped O(1) molecular retrieval
+- NPASS biological annotation integration
+- DrugBank pharmacology integration
+- Enamine REAL database screening with annotations
+- Sharded distributed indexing architecture
+- GPU-accelerated index building
+- Interactive multi-query search sessions
+
+---
+
+## Key Features
+
+- Handles datasets from 136M to 30B+ molecules
+- GPU-accelerated FAISS IVFPQ indexing
+- Morgan fingerprint chemical representation
+- Approximate nearest neighbor (ANN) retrieval
+- Exact Tanimoto / Dice / Tversky reranking
+- Memory-efficient mmap-based retrieval
+- Multi-shard scalable architecture
+- NPASS natural product integration
+- DrugBank pharmacology and target integration
+- Interactive search session mode
+- Binary serialized indexes for fast startup
+
+---
+
+## Architecture Overview
+
+BSCA uses a multi-stage retrieval pipeline:
 
 ```text
-Index build (one-time)
-████████████████████████████████████████ 14 hours
-
-Query time
-█ 1 second
-
-Memory usage
-██████████████ 12–14 GB
+Query SMILES
+      ↓
+RDKit canonicalization
+      ↓
+Morgan fingerprint generation
+      ↓
+FAISS IVF-PQ ANN search  (per shard, sequential or parallel)
+      ↓
+Global candidate merge + deduplication
+      ↓
+Exact RDKit similarity reranking
+      ↓
+NPASS / DrugBank annotation
+      ↓
+Final ranked results  →  TSV output
 ```
-<p><strong>⚡ Note:</strong> Indexing is a one-time cost.  
-Once the index is built, it can be reused for all future searches without rebuilding.</p>
+
+The system supports both:
+- **Single-index** workflows (up to ~136M molecules on a single machine)
+- **Multi-shard** billion-scale workflows with a coordinator that builds and searches N equal shards
+
+A single global offset file enables O(1) retrieval of any molecule directly from the original CXSMILES file without loading the database into RAM. All shards share this one file — the original SMILES data is never duplicated on disk.
+
+---
+
+## Supported Databases
+
+### Enamine REAL
+- Ultra-large synthesizable compound library (136M–30B+ molecules)
+- Physicochemical descriptors (MW, logP, HBA, HBD, TPSA, QED, RotBonds, FSP3)
+- Drug-likeness and fragment flags
+- InChIKey for cross-database matching
+
+### NPASS
+- ~200K natural product compounds
+- Biological activities with target information
+- Toxicity data
+- Organism sources and species pairs
+- Protein targets
+
+### DrugBank
+- ~20K approved, investigational, and experimental drugs
+- Full pharmacology text (mechanism, indication, metabolism, toxicity)
+- Protein targets, enzymes, transporters, carriers
+- Classification, synonyms, drug groups
+
+---
+
+## Installation
+
+### Requirements
+
+- Linux x86-64
+- GCC 15+
+- CUDA-capable GPU (optional, but strongly recommended for index building)
+- CMake ≥ 3.16
+- Conda / Mamba
+
+### 1. Create the Conda environment
+
+```bash
+mamba create -n chem_cpp -c conda-forge \
+    cmake make gcc gxx \
+    boost-cpp eigen \
+    faiss-gpu \
+    -y
+
+conda activate chem_cpp
+```
+
+### 2. Build and install RDKit
+
+```bash
+git clone https://github.com/rdkit/rdkit.git
+cd rdkit && mkdir build && cd build
+
+cmake \
+    -DRDK_BUILD_PYTHON_WRAPPERS=OFF \
+    -DRDK_INSTALL_INTREE=OFF \
+    -DRDK_BUILD_FREETYPE_SUPPORT=OFF \
+    -DRDK_BUILD_CAIRO_SUPPORT=OFF \
+    -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX \
+    ..
+
+make -j$(nproc) && make install
+cd ../..
+```
+
+### 3. Clone and build BSCA
+
+```bash
+git clone https://github.com/onuryus/BSCS.git
+cd BSCS/build
+
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
+```
+
+This produces the following executables in `build/`:
+
+| Executable | Purpose |
+|---|---|
+| `prepare_enamine` | Scan Enamine CXSMILES → byte-offset index |
+| `prepare_npass` | Load NPASS TSV files → binary lookup index |
+| `prepare_drugbank` | Parse DrugBank XML → binary index |
+| `build_enamine_index` | Build one FAISS IVFPQ shard |
+| `build_sharded_database` | Coordinator: build all shards automatically |
+| `search_sharded_database` | Multi-shard search + NPASS/DrugBank annotation |
+
+---
+
+## Configuration
+
+All data paths are stored in a single config file that you fill in once.
+
+```bash
+cp build/config.sh.example build/config.sh
+nano build/config.sh
+```
+
+`config.sh` is listed in `.gitignore` and is never committed.
+
+```bash
+# Enamine REAL Database CXSMILES file
+ENAMINE=/path/to/Enamine_REAL_DB.cxsmiles
+
+# Raw NPASS download directory (contains NPASS3.0_activities.txt etc.)
+NPASS_RAW=/path/to/npass
+
+# Index output directory (will be created automatically)
+IDIR=/path/to/index
+
+# DrugBank XML export — optional, requires a DrugBank account
+DRUGBANK_XML=/path/to/drugbank.xml
+
+# Pre-built DrugBank binary — optional, skips re-indexing if already built
+DRUGBANK_BIN=/path/to/drugbank.bin
+```
+
+---
+
+## Building the Index
+
+```bash
+cd BSCS/build
+bash build_full_sharded.sh
+```
+
+The script runs three steps:
+
+**Step 1 — NPASS** (~30 s)
+Loads raw NPASS TSV files and writes a binary lookup index to `$IDIR/npass/`.
+
+**Step 2 — DrugBank** (~12 s, optional)
+Parses the DrugBank XML and writes `$IDIR/drugbank/drugbank.bin` (~82 MB).
+Skipped gracefully if the XML is not found.
+
+**Step 3 — Enamine sharded FAISS index**
+Builds 4 equal shards of ~34M molecules each.
+Asks once whether to use GPU; the choice is propagated to all shard builds.
+
+```
+shard 001  [mol 0 → 34M]   ████████████████  8 min (GPU)
+shard 002  [mol 34M → 68M] ████████████████  11 min
+shard 003  [mol 68M → 102M]████████████████  11 min
+shard 004  [mol 102M → 136M]███████████████  12 min
+```
+
+**Re-runnable:** any already-built shard (`faiss.index` exists) is skipped.
+Safe to interrupt at any point and re-run.
+
+**Output structure:**
+
+```
+$IDIR/enamine_sharded/
+├── shard_config.json        ← single metadata file (entry point for search)
+├── enamine.offsets.bin      ← global byte-offset index (~1.1 GB)
+├── enamine.header.tsv
+├── enamine.count
+├── shard_001/
+│   └── faiss.index          ← IVFPQ index for molecules [0, 34M)
+├── shard_002/
+│   └── faiss.index
+├── shard_003/
+│   └── faiss.index
+└── shard_004/
+    └── faiss.index
+
+$IDIR/npass/                 ← NPASS binary index (~200 MB)
+$IDIR/drugbank/
+└── drugbank.bin             ← DrugBank binary index (~82 MB)
+```
+
+---
+
+## Searching
+
+### Interactive session (recommended)
+
+```bash
+bash build/search_full_sharded.sh
+```
+
+Databases are loaded once. You enter a SMILES string, results are written to TSV files, and the session continues until you type `quit`.
+
+```
+Enter query SMILES (or 'quit'): c1ccc2c(c1)sc1ccccc12
+  [Phase 2] NPASS similarity search → 3 hits (best: 0.847)
+  [Phase 3] DrugBank similarity search → 1 hit (best: 0.762)
+  [Phase 4] Shard 1/4: FAISS search ...
+  ...
+  [OK] 50 results written to results.tsv
+Enter query SMILES (or 'quit'):
+```
+
+### Single query (non-interactive)
+
+```bash
+./build/search_sharded_database \
+    --config       "$IDIR/enamine_sharded/shard_config.json" \
+    --npass-index  "$NPASS_RAW" \
+    --drugbank-bin "$IDIR/drugbank/drugbank.bin" \
+    --query        "c1ccc2c(c1)sc1ccccc12" \
+    --databases    enamine,npass,drugbank \
+    --metric       tanimoto \
+    --k            5000 \
+    --top          50 \
+    --nprobe       64 \
+    --jobs         1 \
+    --out-mode     both \
+    --out          results.tsv
+```
+
+---
+
+## Search Parameters
+
+| Flag | Default | Description |
+|---|---|---|
+| `--metric` | `tanimoto` | Reranking metric: `tanimoto`, `dice`, `tversky`, `cosine`, `kulczynski` |
+| `--k` | `5000` | Per-shard FAISS candidates (total candidates = k × num_shards before rerank) |
+| `--nprobe` | `64` | IVF cells probed per shard — higher = better recall, slower |
+| `--top` | `50` | Final hits written to output (does not affect speed) |
+| `--jobs` | `1` | Shards searched in parallel (~0.8 GB RAM each) |
+| `--databases` | — | Comma-separated: `enamine`, `nprobe`, `drugbank`, or `all` |
+| `--out-mode` | — | `combined` \| `per-db` \| `both` |
+
+---
+
+## Output Format
+
+With `--out-mode both` and `--out results.tsv`, four files are written per query:
+
+| File | Contents |
+|---|---|
+| `results.tsv` | Combined wide table — all hits, all database columns |
+| `results_enamine.tsv` | Enamine hits with all 19 Enamine descriptor columns |
+| `results_npass.tsv` | NPASS-matched hits with activity, target, toxicity data |
+| `results_drugbank.tsv` | DrugBank-matched hits with pharmacology columns |
+
+Multi-query sessions auto-number output: `results.tsv`, `results_q002.tsv`, `results_q003.tsv`, …
+
+---
+
+## Performance
+
+Benchmarked on **Enamine REAL 136M molecules**, 4 shards × 34M, RTX 4060 Laptop GPU (build), CPU (search):
+
+### Build
+
+| Step | Time |
+|---|---|
+| `prepare_enamine` (136M molecules, 23 GB file) | 27 s |
+| Per-shard FAISS index — GPU (RTX 4060) | ~10–22 min |
+| Full 4-shard build — GPU | ~1 h |
+| Per-shard FAISS index — CPU (12 threads) | ~2–3 h |
+| Full 4-shard build — CPU | ~8–12 h |
+
+### Search (CPU, per query)
+
+| Stage | Time |
+|---|---|
+| NPASS + DrugBank load (first query only) | ~4 s |
+| Per-shard FAISS search (nprobe=64, k=5000) | ~50–200 ms/shard |
+| Enamine record retrieval (mmap, 20K reads) | ~100–300 ms |
+| Exact Tanimoto rerank (20K candidates) | ~200–500 ms |
+| Annotation + TSV write | ~5 ms |
+| **Total per query** | **~0.5–1.5 s** |
+
+### Memory (4 shards × 34M, m=16, jobs=1)
+
+| Component | RAM |
+|---|---|
+| FAISS shard (one at a time) | ~0.8 GB |
+| Global offset file (mmap) | ~1.1 GB |
+| NPASS in RAM | ~0.5 GB |
+| DrugBank in RAM | ~0.1 GB |
+| **Total** | **~2.5 GB** |
+
+`--jobs 4` loads all 4 shards in parallel: ~5 GB, ~4× faster search.
+
+---
+
+## Scaling
+
+| Molecules | Shards | Tier | Index Size | RAM (jobs=1) | Search |
+|---|---|---|---|---|---|
+| 136M | 4 | Balanced (m=16) | ~3.2 GB | ~2.5 GB | ~1 s |
+| 1B | 8 | Balanced (m=16) | ~24 GB | ~4.6 GB | ~1 s |
+| 6B | 44 | Balanced (m=16) | ~140 GB | ~4.6 GB | ~4 s |
+| 15B | 110 | Compact (m=8) | ~165 GB | ~2.7 GB | ~6 s |
+| 30B | 221 | Compact (m=8) | ~330 GB | ~2.7 GB | ~12 s |
+
+See `SCALE_GUIDE.txt` for full parameter recommendations.
+
+---
+
+## Index Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--nbits` | `1024` | Morgan FP bit count — higher = better chemistry, more RAM |
+| `--nlist` | `4096` | IVF cell count — rule: `sqrt(N_shard)` to `4×sqrt(N_shard)` |
+| `--m` | `16` | PQ sub-vectors — `m` bytes stored per molecule |
+| `--train-size` | `500000` | Training molecules per shard (≥30×nlist recommended) |
+| `--batch` | `1000000` | Add-batch size — controls build RAM: `batch × nbits × 4 bytes` |
+| `--threads` | `12` | OMP threads for fingerprint computation |
+| `--num-shards` | `4` | Number of equal shards |
+
+---
+
+## Data Sources
+
+| Database | Access |
+|---|---|
+| **Enamine REAL** | [enamine.net](https://enamine.net/compound-collections/real-compounds/real-database) |
+| **NPASS** | [bidd.group/NPASS](https://bidd.group/NPASS/) — free download |
+| **DrugBank** | [go.drugbank.com](https://go.drugbank.com/releases/latest) — free academic account |

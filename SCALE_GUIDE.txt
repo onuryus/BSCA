@@ -1,0 +1,326 @@
+================================================================================
+  BSCS SCALING GUIDE — Parameters & RAM for Different Molecule Counts
+================================================================================
+
+Last updated: 2026-05-07
+
+FAISS IVFPQ memory formula (per shard):
+  RAM = N × m bytes               ← PQ codes
+      + N × 8 bytes               ← molecule IDs in FAISS
+      + N × 8 bytes               ← offset lookup table (shared across shards)
+      + nlist × nbits × 4 bytes   ← IVF centroids (usually small)
+
+  Example: N=34M/shard (4-shard split of 136M), m=16, nbits=1024, nlist=4096
+    PQ codes  : 34M × 16  = 0.54 GB
+    Mol IDs   : 34M × 8   = 0.27 GB
+    Offsets   : 136M × 8  = 1.09 GB  (shared; one file for all shards)
+    Centroids : 4096 × 1024 × 4 = 16 MB  (negligible)
+    ─────────────────────────────────────
+    Per shard FAISS : ~0.8 GB
+    Shared offsets  : ~1.1 GB
+    Total (1 shard at a time): ~2.0 GB  +  NPASS (~0.5 GB)  +  DrugBank (~0.1 GB)
+
+NPASS + DrugBank: ~0.6 GB fixed (does not scale with molecule count)
+
+Compression tiers (per 34M-molecule shard):
+  ┌────────────────┬───────┬────┬──────────┬───────────────────┬──────────────┐
+  │ Tier           │ nbits │  m │ nbits-pq │  FAISS RAM/shard  │ Recall       │
+  ├────────────────┼───────┼────┼──────────┼───────────────────┼──────────────┤
+  │ High quality   │ 4096  │ 32 │    8     │   ~1.4 GB         │ ★★★★★       │
+  │ Balanced ✓     │ 1024  │ 16 │    8     │   ~0.8 GB         │ ★★★★☆       │
+  │ Compact        │ 1024  │  8 │    8     │   ~0.5 GB         │ ★★★☆☆       │
+  │ Ultra-compact  │  512  │  4 │    8     │   ~0.3 GB         │ ★★☆☆☆       │
+  └────────────────┴───────┴────┴──────────┴───────────────────┴──────────────┘
+
+================================================================================
+  SHARDING ARCHITECTURE (implemented)
+================================================================================
+
+The primary search path uses build_sharded_database + search_sharded_database.
+One original CXSMILES file is shared across all shards — no duplication.
+One global offset file is shared by all shards.
+FAISS mol IDs are global: shard N stores ID = mol_start_N + local_index.
+shard_config.json is the single entry point that describes all shards.
+
+  ── Build shards ─────────────────────────────────────────────────────────────
+
+  # Coordinator tool: runs prepare_enamine once, then build_enamine_index
+  # for each shard. Skips any shard whose faiss.index already exists.
+  # Re-runnable after interruption.
+
+  ./build_sharded_database \
+    --input        $ENAMINE \
+    --outdir       $IDIR/enamine_sharded \
+    --num-shards   NUM_SHARDS \
+    --radius       3  --nbits 1024 \
+    --nlist        NLIST  --m M  --nbits-pq 8 \
+    --train-size   TRAIN \
+    --batch        1000000 \
+    --threads      12 \
+    --yes
+
+  # Asks GPU/CPU choice once; propagates to all shard subprocesses.
+  # Training molecules: first TRAIN molecules of each shard (sequential).
+
+  ── Search (session mode recommended) ────────────────────────────────────────
+
+  # Loads indexes once, loops over queries interactively.
+  # --query for single non-interactive query.
+
+  # NPASS_RAW = directory containing raw NPASS TSV files (e.g. NPASS3.0_activities.txt etc.)
+  # This is the original download directory, NOT $IDIR/npass (which contains binary indexes).
+  ./search_sharded_database \
+    --config       $IDIR/enamine_sharded/shard_config.json \
+    --npass-index  $NPASS_RAW \
+    --drugbank-bin $IDIR/drugbank/drugbank.bin \
+    --databases    enamine,npass,drugbank \
+    --metric       tanimoto \
+    --k            5000 \
+    --top          50 \
+    --nprobe       NPROBE \
+    --jobs         JOBS \
+    --out-mode     both \
+    --out          results.tsv \
+    --no-gpu
+
+  # --jobs N: N shard FAISS indexes loaded and searched in parallel.
+  # RAM scales as: N × shard_faiss_ram + shared_offset_ram + NPASS + DrugBank.
+  # --jobs 1 is the safe default (~2 GB total resident RAM for 4 shards × 34M).
+
+================================================================================
+  SCENARIO 1: 136M molecules  (4 shards × 34M)  — current production
+  RAM: ~2.5 GB (jobs=1) / ~5.5 GB (jobs=4)  |  Disk: ~7 GB (indexes)
+================================================================================
+
+Parameters:
+  --num-shards 4   --nlist 4096  --m 16   --train-size 500000
+  Shard size: 34M  |  train ratio: 500K / 4096 = 122×  (well above min 30×)
+
+Build:
+  ./build_sharded_database \
+    --input        $ENAMINE \
+    --outdir       $IDIR/enamine_sharded \
+    --num-shards   4 \
+    --radius 3     --nbits 1024 \
+    --nlist 4096   --m 16  --nbits-pq 8 \
+    --train-size   500000 \
+    --batch        1000000 \
+    --threads      12 \
+    --yes
+
+Search (interactive session):
+  ./search_sharded_database \
+    --config       $IDIR/enamine_sharded/shard_config.json \
+    --npass-index  $NPASS_RAW \
+    --drugbank-bin $IDIR/drugbank/drugbank.bin \
+    --databases    enamine,npass,drugbank \
+    --metric tanimoto --k 5000 --top 50 --nprobe 64 \
+    --jobs 1 --out-mode both \
+    --out $IDIR/enamine_sharded/results.tsv \
+    --no-gpu
+
+# RAM breakdown (jobs=1):
+#   FAISS/shard   : ~0.8 GB  (loaded one at a time)
+#   Shared offsets: ~1.1 GB  (136M × 8 bytes)
+#   NPASS + DB    : ~0.6 GB
+#   ─────────────────────────
+#   Peak RAM      : ~2.5 GB
+
+# Or with jobs=4 (all 4 shards in parallel):
+#   4 × 0.8 + 1.1 + 0.6 = ~5.0 GB  (~4× faster search)
+
+# Build times (measured):
+#   GPU (RTX-class): ~8-9 min per shard  →  ~35 min total
+#   CPU (12 threads): ~2-3 h per shard   →  ~8-12 h total
+
+================================================================================
+  SCENARIO 2: 1B molecules  (8 shards × 125M)
+  RAM: ~5 GB (jobs=1) / ~35 GB (jobs=8)  |  Disk: ~22 GB (indexes)
+================================================================================
+
+Parameters:
+  --num-shards 8   --nlist 4096  --m 16   --train-size 500000
+  Shard size: 125M  |  train ratio: 500K / 4096 = 122×
+
+Build:
+  ./build_sharded_database \
+    --input        $ENAMINE_1B \
+    --outdir       $IDIR/enamine_sharded_1B \
+    --num-shards   8 \
+    --radius 3     --nbits 1024 \
+    --nlist 4096   --m 16  --nbits-pq 8 \
+    --train-size   500000 \
+    --batch        1000000 \
+    --threads      12 \
+    --yes
+
+Search:
+  ./search_sharded_database \
+    --config       $IDIR/enamine_sharded_1B/shard_config.json \
+    --npass-index  $NPASS_RAW \
+    --drugbank-bin $IDIR/drugbank/drugbank.bin \
+    --databases    enamine,npass,drugbank \
+    --metric tanimoto --k 5000 --top 50 --nprobe 64 \
+    --jobs 1 --out-mode both --no-gpu \
+    --out results.tsv
+
+# RAM breakdown (jobs=1):
+#   FAISS/shard   : ~3.0 GB  (125M × 24 bytes)
+#   Shared offsets: ~1.0 GB  (125M × 8)
+#   NPASS + DB    : ~0.6 GB
+#   ─────────────────────────
+#   Peak RAM (jobs=1): ~4.6 GB  (one shard at a time)
+#   Peak RAM (jobs=8): ~25 GB   (all shards parallel)
+
+================================================================================
+  SCENARIO 3: 6B molecules  (44 shards × 136M)
+  RAM: 64 GB → 14 shards parallel  |  Disk: ~200 GB (indexes) + ~1 TB (CXSMILES)
+================================================================================
+
+Parameters:
+  --num-shards 44  --nlist 4096  --m 16   --train-size 500000
+  Shard size: 136M  |  train ratio: 500K / 4096 = 122×
+
+Build:
+  ./build_sharded_database \
+    --input        $ENAMINE_6B \
+    --outdir       $IDIR/enamine_sharded_6B \
+    --num-shards   44 \
+    --radius 3     --nbits 1024 \
+    --nlist 4096   --m 16  --nbits-pq 8 \
+    --train-size   500000 \
+    --batch        1000000 \
+    --threads      12 \
+    --yes
+
+Search (tune --jobs to your RAM):
+  ./search_sharded_database \
+    --config       $IDIR/enamine_sharded_6B/shard_config.json \
+    --npass-index  $NPASS_RAW \
+    --drugbank-bin $IDIR/drugbank/drugbank.bin \
+    --databases    enamine --metric tanimoto \
+    --k 5000 --top 200 --nprobe 64 \
+    --jobs 14 --out-mode combined --no-gpu \
+    --out results.tsv
+
+# RAM per job: ~3.3 GB (FAISS 0.8 + offsets share costs across jobs)
+# Offset file for 6B: 6B × 8 = ~48 GB (mmap'd, lazily paged — only hot pages resident)
+# 64  GB → --jobs 14 → ceil(44/14) = 4 batch rounds → ~4s search
+# 128 GB → --jobs 28 → ceil(44/28) = 2 batch rounds → ~2s search
+
+================================================================================
+  SCENARIO 4: 15B molecules  (110 shards × 136M)
+  RAM: 64 GB → 6 passes  |  128 GB → 3 passes
+  Disk: ~365 GB (compact index) + ~2.6 TB (CXSMILES)
+================================================================================
+
+# Switch to Compact tier (m=8) to fit more shards in RAM per round:
+Build:
+  ./build_sharded_database \
+    --input        $ENAMINE_15B \
+    --outdir       $IDIR/enamine_sharded_15B \
+    --num-shards   110 \
+    --radius 3     --nbits 1024 \
+    --nlist 8192   --m 8  --nbits-pq 8 \
+    --train-size   2000000 \
+    --batch        1000000 \
+    --threads      12 \
+    --yes
+
+# m=8 compact: ~0.5 GB FAISS per 136M shard
+# 64  GB → --jobs 19 → ceil(110/19) = 6 passes → ~6s search
+# 128 GB → --jobs 38 → ceil(110/38) = 3 passes → ~3s search
+
+================================================================================
+  SCENARIO 5: 30B molecules  (221 shards × 136M)
+  RAM: 64 GB → 12 passes  |  128 GB → 6 passes
+  Disk: ~730 GB (compact index) + ~5.2 TB (CXSMILES)
+================================================================================
+
+Build:
+  ./build_sharded_database \
+    --input        $ENAMINE_30B \
+    --outdir       $IDIR/enamine_sharded_30B \
+    --num-shards   221 \
+    --radius 3     --nbits 1024 \
+    --nlist 8192   --m 8  --nbits-pq 8 \
+    --train-size   2000000 \
+    --batch        1000000 \
+    --threads      12 \
+    --yes
+
+# 64  GB → --jobs 19 → ceil(221/19) = 12 passes → ~12s search
+# 128 GB → --jobs 38 → ceil(221/38) =  6 passes → ~6s search
+
+================================================================================
+  SUMMARY TABLE
+================================================================================
+
+  Molecules │ Shards │  Tier   │ nbits │  m │ nlist │ Disk(idx) │ RAM(jobs=1) │ Search(64GB)
+  ──────────┼────────┼─────────┼───────┼────┼───────┼───────────┼─────────────┼─────────────
+     136M   │    4   │Balanced │ 1024  │ 16 │  4096 │   3.2 GB  │   2.5 GB    │  ~1s
+       1B   │    8   │Balanced │ 1024  │ 16 │  4096 │    24 GB  │   4.6 GB    │  ~1s (1 pass)
+       6B   │   44   │Balanced │ 1024  │ 16 │  4096 │   140 GB  │   4.6 GB    │  ~4s (4 passes)
+      15B   │  110   │Compact  │ 1024  │  8 │  8192 │   165 GB  │   2.7 GB    │  ~6s (6 passes)
+      30B   │  221   │Compact  │ 1024  │  8 │  8192 │   330 GB  │   2.7 GB    │  ~12s (12 passes)
+
+  Notes:
+  - RAM(jobs=1): one shard FAISS in RAM at a time; offsets mmap'd lazily.
+  - Search passes = ceil(num_shards / --jobs). Each pass ~1s for nprobe=64.
+  - Disk(idx): FAISS shard indexes only. Add 8 bytes × N for the global offset file.
+  - CXSMILES disk not listed above: ~190 MB per 1M molecules.
+
+  Disk total (index + offsets + CXSMILES):
+     136M  :   ~10 GB  (7 GB idx + 1.1 GB offsets + 1 GB cxsmiles sample)
+       1B  :  ~200 GB
+       6B  :  ~1.2 TB
+      15B  :  ~3.0 TB
+      30B  :  ~6.0 TB
+
+================================================================================
+  PARAMETER QUICK REFERENCE
+================================================================================
+
+  --num-shards : Number of equal-size shards. build_sharded_database computes
+                 mol_start/mol_end per shard automatically.
+
+  --nbits      : Morgan FP bit count. Higher = better chemistry, more RAM.
+                 Recommended: 1024 (good balance), 4096 (best quality)
+
+  --m          : PQ sub-vectors. Higher = better recall, more RAM (m bytes/mol).
+                 Rule: nbits/64 for balanced, nbits/128 for compact.
+                 Recommended: 16 (nbits=1024, balanced), 8 (nbits=1024, compact)
+
+  --nbits-pq   : Bits per PQ code. 8=standard (1 byte/sub-vec), 4=half size.
+                 Keep at 8 unless RAM is critically tight.
+
+  --nlist      : IVF cell count per shard. Higher = faster search, needs more training.
+                 Rule: sqrt(N_shard) to 4×sqrt(N_shard).
+                 34M/shard → 4096-16384,  136M/shard → 4096-16384
+
+  --nprobe     : Cells probed per shard search. Higher = better recall, slower.
+                 Rule: nprobe/nlist ≈ 1-5%.
+                 nlist=4096 → nprobe=64 (1.5%),  nlist=8192 → nprobe=128 (1.5%)
+
+  --train-size : Molecules for FAISS training per shard.
+                 Minimum: 30 × nlist. Recommended: ≥100 × nlist.
+                 nlist=4096 → min 123K, recommended 500K
+                 nlist=8192 → min 246K, recommended 2M
+                 Note: training molecules are the first train_size molecules
+                 of each shard (sequential from mol_start, not random).
+
+  --batch      : Molecules per add-batch. Affects build peak RAM:
+                 build_RAM ≈ batch × nbits × 4 bytes
+                 nbits=1024, batch=1M → 1M × 1024 × 4 = 4 GB build RAM
+                 Reduce batch if OOM: batch=500000 → 2 GB
+
+  --jobs       : Parallel shard searches in search_sharded_database.
+                 RAM_peak ≈ jobs × shard_faiss_ram + shared_offset_ram + NPASS + DrugBank
+                 Start with --jobs 1; increase if RAM allows.
+
+  --k          : Per-shard FAISS candidate pool. Total candidates = k × num_shards.
+                 Default 5000. Reduce to 500-1000 for fast exploratory searches.
+
+  --top        : Final hits annotated and written to TSV. Does not affect RAM.
+
+================================================================================
