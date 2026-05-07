@@ -173,84 +173,41 @@ Search:
 #   Peak RAM (jobs=8): ~25 GB   (all shards parallel)
 
 ================================================================================
-  SCENARIO 3: 6B molecules  (44 shards × 136M)
-  RAM: 64 GB → 14 shards parallel  |  Disk: ~200 GB (indexes) + ~1 TB (CXSMILES)
+  SCENARIO 3: 10B molecules  (74 shards × 136M)
+  RAM: 64 GB → 29 shards parallel  |  Disk: ~160 GB (indexes) + ~1.7 TB (CXSMILES)
 ================================================================================
 
+# Switch to Compact tier (m=8) to fit more shards in RAM per round:
 Parameters:
-  --num-shards 44  --nlist 4096  --m 16   --train-size 500000
-  Shard size: 136M  |  train ratio: 500K / 4096 = 122×
+  --num-shards 74  --nlist 8192  --m 8   --train-size 2000000
+  Shard size: 136M  |  train ratio: 2M / 8192 = 244×
 
 Build:
   ./build_sharded_database \
-    --input        $ENAMINE_6B \
-    --outdir       $IDIR/enamine_sharded_6B \
-    --num-shards   44 \
+    --input        $ENAMINE_10B \
+    --outdir       $IDIR/enamine_sharded_10B \
+    --num-shards   74 \
     --radius 3     --nbits 1024 \
-    --nlist 4096   --m 16  --nbits-pq 8 \
-    --train-size   500000 \
+    --nlist 8192   --m 8  --nbits-pq 8 \
+    --train-size   2000000 \
     --batch        1000000 \
     --threads      12 \
     --yes
 
 Search (tune --jobs to your RAM):
   ./search_sharded_database \
-    --config       $IDIR/enamine_sharded_6B/shard_config.json \
+    --config       $IDIR/enamine_sharded_10B/shard_config.json \
     --npass-index  $NPASS_RAW \
     --drugbank-bin $IDIR/drugbank/drugbank.bin \
     --databases    enamine --metric tanimoto \
     --k 5000 --top 200 --nprobe 64 \
-    --jobs 14 --out-mode combined --no-gpu \
+    --jobs 29 --out-mode combined \
     --out results.tsv
 
-# RAM per job: ~3.3 GB (FAISS 0.8 + offsets share costs across jobs)
-# Offset file for 6B: 6B × 8 = ~48 GB (mmap'd, lazily paged — only hot pages resident)
-# 64  GB → --jobs 14 → ceil(44/14) = 4 batch rounds → ~4s search
-# 128 GB → --jobs 28 → ceil(44/28) = 2 batch rounds → ~2s search
-
-================================================================================
-  SCENARIO 4: 15B molecules  (110 shards × 136M)
-  RAM: 64 GB → 6 passes  |  128 GB → 3 passes
-  Disk: ~365 GB (compact index) + ~2.6 TB (CXSMILES)
-================================================================================
-
-# Switch to Compact tier (m=8) to fit more shards in RAM per round:
-Build:
-  ./build_sharded_database \
-    --input        $ENAMINE_15B \
-    --outdir       $IDIR/enamine_sharded_15B \
-    --num-shards   110 \
-    --radius 3     --nbits 1024 \
-    --nlist 8192   --m 8  --nbits-pq 8 \
-    --train-size   2000000 \
-    --batch        1000000 \
-    --threads      12 \
-    --yes
-
-# m=8 compact: ~0.5 GB FAISS per 136M shard
-# 64  GB → --jobs 19 → ceil(110/19) = 6 passes → ~6s search
-# 128 GB → --jobs 38 → ceil(110/38) = 3 passes → ~3s search
-
-================================================================================
-  SCENARIO 5: 30B molecules  (221 shards × 136M)
-  RAM: 64 GB → 12 passes  |  128 GB → 6 passes
-  Disk: ~730 GB (compact index) + ~5.2 TB (CXSMILES)
-================================================================================
-
-Build:
-  ./build_sharded_database \
-    --input        $ENAMINE_30B \
-    --outdir       $IDIR/enamine_sharded_30B \
-    --num-shards   221 \
-    --radius 3     --nbits 1024 \
-    --nlist 8192   --m 8  --nbits-pq 8 \
-    --train-size   2000000 \
-    --batch        1000000 \
-    --threads      12 \
-    --yes
-
-# 64  GB → --jobs 19 → ceil(221/19) = 12 passes → ~12s search
-# 128 GB → --jobs 38 → ceil(221/38) =  6 passes → ~6s search
+# RAM per shard (m=8): ~2.2 GB FAISS + shared offsets (~80 GB mmap'd lazily)
+# Offset file for 10B: 10B × 8 = ~80 GB (mmap'd, only accessed pages resident)
+# 64  GB → --jobs 29 → ceil(74/29) = 3 passes → ~3s search
+# 128 GB → --jobs 58 → ceil(74/58) = 2 passes → ~2s search
 
 ================================================================================
   SUMMARY TABLE
@@ -260,9 +217,8 @@ Build:
   ──────────┼────────┼─────────┼───────┼────┼───────┼───────────┼─────────────┼─────────────
      136M   │    4   │Balanced │ 1024  │ 16 │  4096 │   3.2 GB  │   2.5 GB    │  ~1s
        1B   │    8   │Balanced │ 1024  │ 16 │  4096 │    24 GB  │   4.6 GB    │  ~1s (1 pass)
-       6B   │   44   │Balanced │ 1024  │ 16 │  4096 │   140 GB  │   4.6 GB    │  ~4s (4 passes)
-      15B   │  110   │Compact  │ 1024  │  8 │  8192 │   165 GB  │   2.7 GB    │  ~6s (6 passes)
-      30B   │  221   │Compact  │ 1024  │  8 │  8192 │   330 GB  │   2.7 GB    │  ~12s (12 passes)
+       6B   │   44   │Balanced │ 1024  │ 16 │  4096 │   140 GB  │   4.6 GB    │  ~4s (3 passes)
+      10B   │   74   │Compact  │ 1024  │  8 │  8192 │   160 GB  │   2.7 GB    │  ~3s (3 passes)
 
   Notes:
   - RAM(jobs=1): one shard FAISS in RAM at a time; offsets mmap'd lazily.
@@ -271,11 +227,10 @@ Build:
   - CXSMILES disk not listed above: ~190 MB per 1M molecules.
 
   Disk total (index + offsets + CXSMILES):
-     136M  :   ~10 GB  (7 GB idx + 1.1 GB offsets + 1 GB cxsmiles sample)
+     136M  :   ~10 GB
        1B  :  ~200 GB
        6B  :  ~1.2 TB
-      15B  :  ~3.0 TB
-      30B  :  ~6.0 TB
+      10B  :  ~1.94 TB
 
 ================================================================================
   PARAMETER QUICK REFERENCE

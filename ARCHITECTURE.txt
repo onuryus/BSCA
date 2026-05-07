@@ -885,7 +885,7 @@ Primary data:
     --jobs 4: ~5.4 GB resident RAM, all shards searched simultaneously (~4× faster)
 
   Scaling to larger datasets:
-    30B molecules → 221 shards × 136M  (see SCALE_GUIDE.txt)
+    10B molecules → 74 shards × 136M  (see SCALE_GUIDE.txt)
     Shard size can be tuned via --mols-per-shard instead of --num-shards.
     Recommended nlist per shard: sqrt(N_shard) to 4×sqrt(N_shard).
     136M/shard → nlist 4096-16384.

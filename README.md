@@ -22,7 +22,7 @@ BSCA supports:
 
 ## Key Features
 
-- Handles datasets from 136M to 30B+ molecules
+- Handles datasets from 136M to 10B+ molecules
 - GPU-accelerated FAISS IVFPQ indexing
 - Morgan fingerprint chemical representation
 - Approximate nearest neighbor (ANN) retrieval
@@ -69,7 +69,7 @@ A single global offset file enables O(1) retrieval of any molecule directly from
 ## Supported Databases
 
 ### Enamine REAL
-- Ultra-large synthesizable compound library (136M–30B+ molecules)
+- Ultra-large synthesizable compound library (136M–10B+ molecules)
 - Physicochemical descriptors (MW, logP, HBA, HBD, TPSA, QED, RotBonds, FSP3)
 - Drug-likeness and fragment flags
 - InChIKey for cross-database matching
@@ -335,8 +335,7 @@ Benchmarked on **Enamine REAL 136M molecules**, 4 shards × 34M, RTX 4060 Laptop
 | Database | Shards | Passes | FAISS search | Total |
 |---|---|---|---|---|
 | 1B mol (8 shards) | 8 | 1 | ~40–240 ms | **~0.4–1.0 s** |
-| 10B mol (74 shards) | 74 | 4 | ~0.8–2 s | **~1.5–3 s** |
-| 30B mol (221 shards) | 221 | 12 | ~2–3 s | **~3–4 s** |
+| 10B mol (74 shards) | 74 | 3 | ~0.6–1.5 s | **~1–2.5 s** |
 
 > Passes = number of search rounds based on available RAM (64 GB assumed).
 > Retrieval and rerank cost scales with total candidates, not shard count.
@@ -350,8 +349,7 @@ Benchmarked on **Enamine REAL 136M molecules**, 4 shards × 34M, RTX 4060 Laptop
 | 136M | 4 | Balanced (m=16) | ~3.2 GB | ~2.5 GB | ~1 s |
 | 1B | 8 | Balanced (m=16) | ~24 GB | ~4.6 GB | ~1 s |
 | 6B | 44 | Balanced (m=16) | ~140 GB | ~4.6 GB | ~4 s |
-| 15B | 110 | Compact (m=8) | ~165 GB | ~2.7 GB | ~6 s |
-| 30B | 221 | Compact (m=8) | ~330 GB | ~2.7 GB | ~12 s |
+| 10B | 74 | Compact (m=8) | ~160 GB | ~2.7 GB | ~3 s |
 
 See `SCALE_GUIDE.txt` for full parameter recommendations.
 
